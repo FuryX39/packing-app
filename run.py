@@ -6,7 +6,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from api_client import AuthError, WarehouseApiClient
 from local_print import barcode_label_pdf, print_pdf
-from packing_config import load_config, save_config
+from packing_config import load_config, parse_label_size_mm, save_config
 
 
 def normalize_barcodes(raw) -> list[dict[str, str]]:
@@ -271,6 +271,9 @@ class PackingApp(tk.Tk):
     def set_status(self, text: str) -> None:
         self.status.config(text=text)
         self.update_idletasks()
+
+    def _label_size_mm(self) -> tuple[float, float]:
+        return parse_label_size_mm(self.config_data.get("print_settings", ""))
 
     def _run_task(self, worker, on_success, on_error=None) -> None:
         def runner() -> None:
@@ -637,9 +640,16 @@ class PackingApp(tk.Tk):
         print_name = barcode_print_name(product, barcode_item)
         sku = str(product.get("sku") or barcode)
         copies = self._resolve_catalog_copies(str(product.get("id") or ""))
+        label_w, label_h = self._label_size_mm()
 
         def worker():
-            pdf = barcode_label_pdf(barcode, sku=sku, name=print_name)
+            pdf = barcode_label_pdf(
+                barcode,
+                sku=sku,
+                name=print_name,
+                width_mm=label_w,
+                height_mm=label_h,
+            )
             print_pdf(
                 pdf,
                 sumatra=self.config_data["sumatra"],
@@ -656,8 +666,16 @@ class PackingApp(tk.Tk):
         )
 
     def _print_barcode_label(self, barcode: str, name: str) -> None:
+        label_w, label_h = self._label_size_mm()
+
         def worker():
-            pdf = barcode_label_pdf(barcode, sku=barcode, name=name)
+            pdf = barcode_label_pdf(
+                barcode,
+                sku=barcode,
+                name=name,
+                width_mm=label_w,
+                height_mm=label_h,
+            )
             print_pdf(
                 pdf,
                 sumatra=self.config_data["sumatra"],
@@ -698,13 +716,14 @@ class SettingsWindow(tk.Toplevel):
         self._row(root, 0, "Адрес сервера", "server_url", "https://example.com")
         self._row(root, 1, "SumatraPDF.exe", "sumatra", r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe", browse=True)
         self._row(root, 2, "Имя принтера", "printer", "Если пусто, принтер по умолчанию")
-        self._row(root, 3, "Параметры печати", "print_settings", "noscale,portrait,disable-auto-rotation,paper=40mm x 30mm")
+        self._row(root, 3, "Параметры печати", "print_settings", "noscale,portrait,disable-auto-rotation,paper=47mm x 25mm")
         self._row(root, 4, "Автообновление, сек", "refresh_seconds", "30")
 
         hint = ttk.Label(
             root,
             text=(
                 "Настройки сохраняются в config.env рядом с приложением. "
+                "Размер этикетки задаётся в paper=ШИРИНАmm x ВЫСОТАmm (например paper=47mm x 25mm). "
                 "Для печати PDF нужен SumatraPDF. Вход выполняется логином и паролем от панели склада."
             ),
             wraplength=660,

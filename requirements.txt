@@ -3,3 +3,4 @@ python-dotenv
 python-barcode
 reportlab
 Pillow
+pypdf>=5.0.0

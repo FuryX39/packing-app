@@ -22,6 +22,24 @@ TEXT_SIDE_MARGIN_MM = 1.2
 NAME_MAX_LINES = 2
 
 
+def _multiply_pdf_pages(pdf_bytes: bytes, copies: int) -> bytes:
+    """Один PDF с N одинаковыми страницами — одно задание на принтер."""
+    if copies <= 1:
+        return pdf_bytes
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    if not reader.pages:
+        raise ValueError("Empty PDF")
+    page = reader.pages[0]
+    writer = PdfWriter()
+    for _ in range(copies):
+        writer.add_page(page)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
 def print_pdf(
     pdf_bytes: bytes,
     *,
@@ -36,37 +54,37 @@ def print_pdf(
     exe = Path(sumatra)
     if not exe.is_file():
         raise FileNotFoundError(f"SumatraPDF not found: {sumatra}")
-    for _ in range(count):
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(pdf_bytes)
-            path = Path(tmp.name)
-        cmd = [str(exe), "-silent", "-exit-when-done"]
-        if printer:
-            cmd.extend(["-print-to", printer])
-        else:
-            cmd.append("-print-to-default")
-        if print_settings:
-            cmd.extend(["-print-settings", print_settings])
-        cmd.append(str(path))
+    payload = _multiply_pdf_pages(pdf_bytes, count)
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(payload)
+        path = Path(tmp.name)
+    cmd = [str(exe), "-silent", "-exit-when-done"]
+    if printer:
+        cmd.extend(["-print-to", printer])
+    else:
+        cmd.append("-print-to-default")
+    if print_settings:
+        cmd.extend(["-print-settings", print_settings])
+    cmd.append(str(path))
 
-        popen_kwargs: dict = {
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-        }
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    popen_kwargs: dict = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-        proc = subprocess.Popen(cmd, **popen_kwargs)
+    proc = subprocess.Popen(cmd, **popen_kwargs)
 
-        def _wait_and_cleanup(process=proc, file_path=path) -> None:
-            try:
-                process.wait(timeout=90)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            finally:
-                file_path.unlink(missing_ok=True)
+    def _wait_and_cleanup(process=proc, file_path=path) -> None:
+        try:
+            process.wait(timeout=max(90, count * 2))
+        except subprocess.TimeoutExpired:
+            process.kill()
+        finally:
+            file_path.unlink(missing_ok=True)
 
-        threading.Thread(target=_wait_and_cleanup, daemon=True).start()
+    threading.Thread(target=_wait_and_cleanup, daemon=True).start()
 
 
 def _trim_barcode_whitespace(img: Image.Image) -> Image.Image:

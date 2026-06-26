@@ -1,0 +1,5 @@
+requests
+python-dotenv
+python-barcode
+reportlab
+Pillow

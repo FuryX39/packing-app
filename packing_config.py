@@ -14,6 +14,10 @@ DEFAULT_CONFIG = {
     "sumatra": r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe",
     "printer": "",
     "print_settings": "noscale,portrait,disable-auto-rotation,paper=47mm x 25mm",
+    "printer_a4": "",
+    "print_settings_a4": "paper=A4,portrait",
+    "printer_label": "",
+    "print_settings_label": "noscale,portrait,disable-auto-rotation,paper=47mm x 25mm",
     "refresh_seconds": "30",
 }
 
@@ -22,20 +26,35 @@ ENV_KEYS = {
     "sumatra": "BARCODE_PRINT_SUMATRA",
     "printer": "BARCODE_PRINT_PRINTER",
     "print_settings": "BARCODE_PRINT_SETTINGS",
+    "printer_a4": "BARCODE_PRINT_PRINTER_A4",
+    "print_settings_a4": "BARCODE_PRINT_SETTINGS_A4",
+    "printer_label": "BARCODE_PRINT_PRINTER_LABEL",
+    "print_settings_label": "BARCODE_PRINT_SETTINGS_LABEL",
     "refresh_seconds": "REFRESH_SECONDS",
 }
 
 
 def load_config() -> dict[str, str]:
     load_dotenv(CONFIG_PATH, override=True)
+    printer = (os.getenv("BARCODE_PRINT_PRINTER") or DEFAULT_CONFIG["printer"]).strip()
+    print_settings = (
+        os.getenv("BARCODE_PRINT_SETTINGS") or DEFAULT_CONFIG["print_settings"]
+    ).strip()
+    printer_label = (os.getenv("BARCODE_PRINT_PRINTER_LABEL") or printer).strip()
+    print_settings_label = (
+        os.getenv("BARCODE_PRINT_SETTINGS_LABEL") or print_settings
+    ).strip()
     return {
         "server_url": (os.getenv("WAREHOUSE_SERVER_URL") or DEFAULT_CONFIG["server_url"]).strip().rstrip("/"),
         "sumatra": (os.getenv("BARCODE_PRINT_SUMATRA") or DEFAULT_CONFIG["sumatra"]).strip(),
-        "printer": (os.getenv("BARCODE_PRINT_PRINTER") or DEFAULT_CONFIG["printer"]).strip(),
-        "print_settings": (
-            os.getenv("BARCODE_PRINT_SETTINGS")
-            or DEFAULT_CONFIG["print_settings"]
+        "printer": printer,
+        "print_settings": print_settings,
+        "printer_a4": (os.getenv("BARCODE_PRINT_PRINTER_A4") or DEFAULT_CONFIG["printer_a4"]).strip(),
+        "print_settings_a4": (
+            os.getenv("BARCODE_PRINT_SETTINGS_A4") or DEFAULT_CONFIG["print_settings_a4"]
         ).strip(),
+        "printer_label": printer_label,
+        "print_settings_label": print_settings_label,
         "refresh_seconds": (os.getenv("REFRESH_SECONDS") or DEFAULT_CONFIG["refresh_seconds"]).strip(),
     }
 

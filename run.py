@@ -1,12 +1,32 @@
 from __future__ import annotations
 
 import threading
+from datetime import date, timedelta
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+import os
+import ctypes
 
 from api_client import AuthError, WarehouseApiClient
 from local_print import barcode_label_pdf, print_pdf
 from packing_config import load_config, parse_label_size_mm, save_config
+
+
+def _configure_windows_dpi_awareness() -> None:
+    """Make Tkinter render crisp UI (avoid bitmap scaling) on Windows."""
+    if os.name != "nt":
+        return
+    try:
+        # 2 = PER_MONITOR_DPI_AWARE
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        # Fallback for older Windows.
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 
 def normalize_barcodes(raw) -> list[dict[str, str]]:
@@ -45,6 +65,41 @@ def barcode_combo_label(barcode_item: dict) -> str:
     if title and code and title != code:
         return f"{title} ({code})"
     return title or code
+
+
+def format_task_day(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "—"
+    parts = raw.split("-")
+    if len(parts) == 3:
+        return f"{parts[2]}.{parts[1]}.{parts[0]}"
+    return raw
+
+
+def parse_task_day(value: str) -> date | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    parts = raw.split("-")
+    if len(parts) != 3:
+        return None
+    try:
+        return date(int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError:
+        return None
+
+
+def ship_date_tag(end_date: str, *, today: date | None = None) -> str:
+    ship = parse_task_day(end_date)
+    if ship is None:
+        return ""
+    current = today or date.today()
+    if ship == current:
+        return "ship_today"
+    if ship == current + timedelta(days=1):
+        return "ship_tomorrow"
+    return ""
 
 
 class LoginWindow(tk.Tk):
@@ -156,15 +211,40 @@ class PackingApp(tk.Tk):
         self._catalog_loading = False
         self._catalog_search_job: str | None = None
         self._print_in_progress = False
+        self.tasks: list[dict] = []
+        self.current_task: dict | None = None
+        self.task_statuses: list[dict] = []
+        self._status_id_by_name: dict[str, int] = {}
+        self._task_status_silent = False
+        self._tasks_refresh_job: str | None = None
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self._configure_catalog_styles()
+        self._configure_tasks_styles()
         self._build_ui()
-        self.after(100, self.load_supplies)
+        # Maximize window without enabling fullscreen mode.
+        # On Windows Tkinter "zoomed" typically expands to available screen area (not exclusive fullscreen).
+        try:
+            self.state("zoomed")
+        except Exception:
+            pass
+        self.after(200, self.load_tasks)
 
     def _configure_catalog_styles(self) -> None:
         style = ttk.Style(self)
         style.configure("CatalogPrint.Treeview", rowheight=28)
         style.configure("CatalogPrintHeading.Treeview.Heading", font=("Segoe UI", 9, "bold"))
+
+    def _configure_tasks_styles(self) -> None:
+        self.tasks_tree_tags_ready = False
+
+    def _ensure_tasks_tree_tags(self) -> None:
+        if getattr(self, "tasks_tree_tags_ready", False):
+            return
+        if not hasattr(self, "tasks_tree"):
+            return
+        self.tasks_tree.tag_configure("ship_today", background="#ffcdd2")
+        self.tasks_tree.tag_configure("ship_tomorrow", background="#fff9c4")
+        self.tasks_tree_tags_ready = True
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=10)
@@ -178,7 +258,7 @@ class PackingApp(tk.Tk):
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=10)
 
-        self._build_fbo_tab()
+        self._build_tasks_tab()
         self._build_catalog_tab()
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
@@ -213,6 +293,80 @@ class PackingApp(tk.Tk):
         self.items.heading("sku", text="SKU")
         self.items.heading("qty", text="Кол-во")
         self.items.pack(fill=tk.BOTH, expand=True)
+
+    def _build_tasks_tab(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=6)
+        self.notebook.add(tab, text="Задания")
+
+        toolbar = ttk.Frame(tab)
+        toolbar.pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(toolbar, text="Обновить", command=self.load_tasks).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="Печать все А4", command=lambda: self.print_task_attachments("a4")).pack(
+            side=tk.LEFT, padx=6
+        )
+        ttk.Button(toolbar, text="Печать все этикетки", command=lambda: self.print_task_attachments("label")).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(toolbar, text="Печать всё", command=self.print_all_task_attachments).pack(side=tk.LEFT, padx=6)
+
+        panes = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        panes.pack(fill=tk.BOTH, expand=True)
+
+        left = ttk.Frame(panes)
+        right = ttk.Frame(panes)
+        panes.add(left, weight=1)
+        panes.add(right, weight=2)
+
+        ttk.Label(left, text="Мои задания").pack(anchor=tk.W)
+        self.tasks_tree = ttk.Treeview(
+            left,
+            columns=("assembly", "marketplace", "ship"),
+            show="headings",
+            height=12,
+        )
+        self.tasks_tree.heading("assembly", text="Дата сборки")
+        self.tasks_tree.heading("marketplace", text="Маркетплейс")
+        self.tasks_tree.heading("ship", text="Дата отгрузки")
+        self.tasks_tree.column("assembly", width=100, stretch=False)
+        self.tasks_tree.column("marketplace", width=160)
+        self.tasks_tree.column("ship", width=100, stretch=False)
+        self.tasks_tree.pack(fill=tk.BOTH, expand=True)
+        self.tasks_tree.bind("<<TreeviewSelect>>", self.on_task_select)
+        self._ensure_tasks_tree_tags()
+
+        ttk.Label(right, text="Детали задания").pack(anchor=tk.W)
+        status_row = ttk.Frame(right)
+        status_row.pack(fill=tk.X, pady=(4, 8))
+        ttk.Label(status_row, text="Статус").pack(side=tk.LEFT)
+        self.task_status_var = tk.StringVar()
+        self.task_status_combo = ttk.Combobox(
+            status_row,
+            textvariable=self.task_status_var,
+            state="readonly",
+            width=28,
+        )
+        self.task_status_combo.pack(side=tk.LEFT, padx=(8, 0))
+        self.task_status_combo.bind("<<ComboboxSelected>>", self.on_task_status_change)
+
+        self.task_description = tk.Text(right, height=10, wrap=tk.WORD, state=tk.DISABLED)
+        self.task_description.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
+
+        files_frame = ttk.LabelFrame(right, text="Файлы для печати", padding=8)
+        files_frame.pack(fill=tk.BOTH, expand=True)
+        self.task_files = ttk.Treeview(
+            files_frame,
+            columns=("kind", "filename", "action"),
+            show="headings",
+            height=8,
+        )
+        self.task_files.heading("kind", text="Тип")
+        self.task_files.heading("filename", text="Файл")
+        self.task_files.heading("action", text="")
+        self.task_files.column("kind", width=90, stretch=False)
+        self.task_files.column("filename", width=260)
+        self.task_files.column("action", width=90, stretch=False, anchor=tk.CENTER)
+        self.task_files.pack(fill=tk.BOTH, expand=True)
+        self.task_files.bind("<Button-1>", self._on_task_files_click)
 
     def _build_catalog_tab(self) -> None:
         tab = ttk.Frame(self.notebook, padding=6)
@@ -272,8 +426,23 @@ class PackingApp(tk.Tk):
         self.status.config(text=text)
         self.update_idletasks()
 
+    def _label_print_profile(self) -> dict[str, str]:
+        return {
+            "sumatra": self.config_data["sumatra"],
+            "printer": self.config_data.get("printer_label") or self.config_data.get("printer", ""),
+            "print_settings": self.config_data.get("print_settings_label")
+            or self.config_data.get("print_settings", ""),
+        }
+
+    def _a4_print_profile(self) -> dict[str, str]:
+        return {
+            "sumatra": self.config_data["sumatra"],
+            "printer": self.config_data.get("printer_a4", ""),
+            "print_settings": self.config_data.get("print_settings_a4", "paper=A4,portrait"),
+        }
+
     def _label_size_mm(self) -> tuple[float, float]:
-        return parse_label_size_mm(self.config_data.get("print_settings", ""))
+        return parse_label_size_mm(self._label_print_profile()["print_settings"])
 
     def _run_task(self, worker, on_success, on_error=None) -> None:
         def runner() -> None:
@@ -320,6 +489,7 @@ class PackingApp(tk.Tk):
         self.set_status("Ошибка")
 
     def on_close(self) -> None:
+        self._cancel_tasks_refresh()
         self.client.logout()
         self.destroy()
 
@@ -390,14 +560,337 @@ class PackingApp(tk.Tk):
 
         def worker():
             pdf = self.client.download_labels_pdf(supply_id)
-            print_pdf(
-                pdf,
-                sumatra=self.config_data["sumatra"],
-                printer=self.config_data["printer"],
-                print_settings=self.config_data["print_settings"],
-            )
+            profile = self._label_print_profile()
+            print_pdf(pdf, **profile)
 
         self._run_in_background("Скачивание и печать PDF...", worker, lambda _r: self.set_status("PDF отправлен на печать"))
+
+    def _ship_date_tag(self, end_date: str) -> str:
+        return ship_date_tag(end_date)
+
+    def _ensure_task_statuses_loaded(self) -> None:
+        if self.task_statuses:
+            return
+        try:
+            self.task_statuses = self.client.get_task_statuses()
+        except Exception:
+            self.task_statuses = []
+        self._status_id_by_name = {
+            str(item.get("name") or ""): int(item["id"])
+            for item in self.task_statuses
+            if item.get("id") is not None
+        }
+
+    def _task_tree_values(self, task: dict) -> tuple[str, str, str]:
+        return (
+            format_task_day(task.get("start_date", "")),
+            task.get("counterparty_name") or "—",
+            format_task_day(task.get("end_date", "")),
+        )
+
+    def _apply_task_tree_row(self, task: dict) -> None:
+        self._ensure_tasks_tree_tags()
+        task_id = str(task.get("id"))
+        tag = self._ship_date_tag(str(task.get("end_date") or ""))
+        tags = (tag,) if tag else ()
+        values = self._task_tree_values(task)
+        if self.tasks_tree.exists(task_id):
+            self.tasks_tree.item(task_id, values=values, tags=tags)
+        else:
+            self.tasks_tree.insert("", tk.END, iid=task_id, values=values, tags=tags)
+
+    def _sync_task_cache(self, task: dict) -> None:
+        task_id = int(task.get("id") or 0)
+        if not task_id:
+            return
+        for idx, item in enumerate(self.tasks):
+            if int(item.get("id") or 0) == task_id:
+                self.tasks[idx] = task
+                return
+        self.tasks.append(task)
+
+    def _render_task_status(self, task: dict) -> None:
+        self._ensure_task_statuses_loaded()
+        names = [str(item.get("name") or "") for item in self.task_statuses if item.get("name")]
+        self.task_status_combo["values"] = names
+        if not task:
+            self._task_status_silent = True
+            self.task_status_var.set("")
+            self._task_status_silent = False
+            return
+        current = str(task.get("status_name") or "")
+        self._task_status_silent = True
+        self.task_status_var.set(current if current in names else (names[0] if names else ""))
+        self._task_status_silent = False
+
+    def on_task_status_change(self, _event=None) -> None:
+        if self._task_status_silent:
+            return
+        task = self.current_task
+        if not task:
+            return
+        name = self.task_status_var.get().strip()
+        status_id = self._status_id_by_name.get(name)
+        if status_id is None or int(task.get("status_id") or 0) == status_id:
+            return
+        task_id = int(task["id"])
+
+        def worker():
+            return self.client.patch_task(task_id, {"status_id": status_id})
+
+        def on_updated(updated: dict) -> None:
+            self.current_task = updated
+            self._sync_task_cache(updated)
+            self._apply_task_tree_row(updated)
+            self._render_task_status(updated)
+            self.set_status(f"Статус: {updated.get('status_name', name)}")
+
+        def on_error(exc: Exception) -> None:
+            self._render_task_status(task)
+            self._background_error(exc)
+
+        self.set_status("Сохранение статуса...")
+        self._run_task(worker, on_updated, on_error)
+
+    def _maybe_mark_task_in_progress(self) -> None:
+        task = self.current_task
+        if not task:
+            return
+        if str(task.get("status_name") or "") != "Новый":
+            return
+        self._ensure_task_statuses_loaded()
+        status_id = self._status_id_by_name.get("В работе")
+        if status_id is None:
+            return
+        task_id = int(task["id"])
+
+        def worker():
+            return self.client.patch_task(task_id, {"status_id": status_id})
+
+        def on_updated(updated: dict) -> None:
+            self.current_task = updated
+            self._sync_task_cache(updated)
+            self._render_task_status(updated)
+            self.set_status(f"Статус изменён: {updated.get('status_name', 'В работе')}")
+
+        def on_error(exc: Exception) -> None:
+            if isinstance(exc, AuthError):
+                messagebox.showerror("Сессия", str(exc))
+                self.on_close()
+                return
+            self.set_status("Не удалось обновить статус задачи")
+
+        self._run_task(worker, on_updated, on_error)
+
+    def _on_task_print_done(self, message: str) -> None:
+        self.set_status(message)
+        self._maybe_mark_task_in_progress()
+
+    def _tasks_refresh_interval_ms(self) -> int:
+        try:
+            seconds = int(self.config_data.get("refresh_seconds") or "30")
+        except ValueError:
+            seconds = 30
+        return max(5, seconds) * 1000
+
+    def _cancel_tasks_refresh(self) -> None:
+        if self._tasks_refresh_job is not None:
+            self.after_cancel(self._tasks_refresh_job)
+            self._tasks_refresh_job = None
+
+    def _schedule_tasks_refresh(self) -> None:
+        self._cancel_tasks_refresh()
+        self._tasks_refresh_job = self.after(self._tasks_refresh_interval_ms(), self._tasks_auto_refresh)
+
+    def _tasks_auto_refresh(self) -> None:
+        self._tasks_refresh_job = None
+        tab_id = self.notebook.select()
+        if self.notebook.tab(tab_id, "text") != "Задания":
+            return
+        self.load_tasks(silent=True)
+
+    def load_tasks(self, *, silent: bool = False) -> None:
+        if not silent:
+            self.set_status("Загрузка заданий...")
+        self._ensure_task_statuses_loaded()
+        try:
+            self.tasks = self.client.get_my_tasks()
+        except AuthError as exc:
+            messagebox.showerror("Сессия", str(exc))
+            self.on_close()
+            return
+        except Exception as exc:
+            messagebox.showerror("Ошибка загрузки", str(exc))
+            self.set_status("Ошибка")
+            return
+
+        selected_id: int | None = None
+        if self.current_task:
+            selected_id = int(self.current_task.get("id") or 0) or None
+        self.tasks_tree.delete(*self.tasks_tree.get_children())
+        self._ensure_tasks_tree_tags()
+        for task in self.tasks:
+            self._apply_task_tree_row(task)
+        if selected_id is not None and self.tasks_tree.exists(str(selected_id)):
+            self.tasks_tree.selection_set(str(selected_id))
+            self.tasks_tree.focus(str(selected_id))
+            self.on_task_select()
+        elif self.current_task:
+            self.current_task = None
+            self.render_task()
+        self.set_status(f"Заданий: {len(self.tasks)}")
+        tab_id = self.notebook.select()
+        if self.notebook.tab(tab_id, "text") == "Задания":
+            self._schedule_tasks_refresh()
+
+    def on_task_select(self, _event=None) -> None:
+        selected = self.tasks_tree.selection()
+        if not selected:
+            return
+        task_id = int(selected[0])
+        try:
+            self.set_status("Загрузка задания...")
+            self.current_task = self.client.get_task(task_id)
+        except AuthError as exc:
+            messagebox.showerror("Сессия", str(exc))
+            self.on_close()
+            return
+        except Exception as exc:
+            messagebox.showerror("Ошибка", str(exc))
+            self.set_status("Ошибка")
+            return
+        self.render_task()
+
+    def render_task(self) -> None:
+        task = self.current_task or {}
+        self._render_task_status(task)
+        self.task_description.config(state=tk.NORMAL)
+        self.task_description.delete("1.0", tk.END)
+        description = str(task.get("description") or "").strip()
+        self.task_description.insert("1.0", description or "—")
+        self.task_description.config(state=tk.DISABLED)
+
+        self.task_files.delete(*self.task_files.get_children())
+        for attachment in task.get("attachments") or []:
+            kind = str(attachment.get("kind") or "")
+            kind_label = "А4" if kind == "a4" else "Этикетки" if kind == "label" else kind
+            self.task_files.insert(
+                "",
+                tk.END,
+                iid=str(attachment.get("id")),
+                values=(
+                    kind_label,
+                    attachment.get("filename") or "file.pdf",
+                    "Печать",
+                ),
+            )
+        title = task.get("counterparty_name") or f"Задание #{task.get('id', '')}"
+        self.set_status(f"Открыто: {title}")
+
+    def _on_task_files_click(self, event) -> None:
+        column = self.task_files.identify_column(event.x)
+        item = self.task_files.identify_row(event.y)
+        if not item or column != "#3":
+            return
+        self.print_task_attachment(int(item))
+
+    def _print_profile_for_kind(self, kind: str) -> dict[str, str]:
+        if kind == "a4":
+            return self._a4_print_profile()
+        return self._label_print_profile()
+
+    def _task_attachments(self, kind: str | None = None) -> list[dict]:
+        task = self.current_task
+        if not task:
+            return []
+        attachments = list(task.get("attachments") or [])
+        if kind is None:
+            return attachments
+        return [item for item in attachments if str(item.get("kind") or "") == kind]
+
+    def print_task_attachment(self, attachment_id: int) -> None:
+        task = self.current_task
+        if not task:
+            messagebox.showwarning("Нет задания", "Выберите задание")
+            return
+        attachment = next(
+            (item for item in (task.get("attachments") or []) if int(item.get("id") or 0) == attachment_id),
+            None,
+        )
+        if attachment is None:
+            messagebox.showwarning("Нет файла", "Файл не найден")
+            return
+        kind = str(attachment.get("kind") or "")
+        profile = self._print_profile_for_kind(kind)
+        task_id = int(task["id"])
+
+        def worker():
+            pdf = self.client.download_task_attachment(task_id, attachment_id)
+            print_pdf(pdf, **profile)
+            return attachment.get("filename") or "file.pdf"
+
+        self._run_in_background(
+            "Печать файла...",
+            worker,
+            lambda name: self._on_task_print_done(f"Файл «{name}» отправлен на печать"),
+        )
+
+    def print_task_attachments(self, kind: str) -> None:
+        task = self.current_task
+        if not task:
+            messagebox.showwarning("Нет задания", "Выберите задание")
+            return
+        attachments = self._task_attachments(kind)
+        if not attachments:
+            label = "А4" if kind == "a4" else "этикетки"
+            messagebox.showwarning("Нет файлов", f"У задания нет PDF для печати ({label})")
+            return
+        profile = self._print_profile_for_kind(kind)
+        task_id = int(task["id"])
+
+        def worker():
+            for attachment in attachments:
+                pdf = self.client.download_task_attachment(task_id, int(attachment["id"]))
+                print_pdf(pdf, **profile)
+            return len(attachments)
+
+        kind_label = "А4" if kind == "a4" else "этикетки"
+        self._run_in_background(
+            f"Печать {kind_label}...",
+            worker,
+            lambda count: self._on_task_print_done(f"Напечатано файлов ({kind_label}): {count}"),
+        )
+
+    def print_all_task_attachments(self) -> None:
+        task = self.current_task
+        if not task:
+            messagebox.showwarning("Нет задания", "Выберите задание")
+            return
+        a4_items = self._task_attachments("a4")
+        label_items = self._task_attachments("label")
+        if not a4_items and not label_items:
+            messagebox.showwarning("Нет файлов", "У задания нет PDF для печати")
+            return
+        task_id = int(task["id"])
+        a4_profile = self._a4_print_profile()
+        label_profile = self._label_print_profile()
+
+        def worker():
+            for attachment in a4_items:
+                pdf = self.client.download_task_attachment(task_id, int(attachment["id"]))
+                print_pdf(pdf, **a4_profile)
+            for attachment in label_items:
+                pdf = self.client.download_task_attachment(task_id, int(attachment["id"]))
+                print_pdf(pdf, **label_profile)
+            return len(a4_items), len(label_items)
+
+        self._run_in_background(
+            "Печать всех файлов...",
+            worker,
+            lambda counts: self._on_task_print_done(
+                f"Напечатано: А4 — {counts[0]}, этикетки — {counts[1]}"
+            ),
+        )
 
     def print_selected_barcode(self) -> None:
         selected = self.items.selection()
@@ -617,8 +1110,13 @@ class PackingApp(tk.Tk):
 
     def _on_notebook_tab_changed(self, _event=None) -> None:
         tab_id = self.notebook.select()
-        if self.notebook.tab(tab_id, "text") == "Номенклатура":
+        tab_text = self.notebook.tab(tab_id, "text")
+        if tab_text == "Номенклатура":
             self.load_catalog()
+        elif tab_text == "Задания":
+            self.load_tasks()
+        else:
+            self._cancel_tasks_refresh()
 
     def _on_catalog_search_key(self, _event=None) -> None:
         if self._catalog_search_job is not None:
@@ -650,13 +1148,7 @@ class PackingApp(tk.Tk):
                 width_mm=label_w,
                 height_mm=label_h,
             )
-            print_pdf(
-                pdf,
-                sumatra=self.config_data["sumatra"],
-                printer=self.config_data["printer"],
-                print_settings=self.config_data["print_settings"],
-                copies=copies,
-            )
+            print_pdf(pdf, **self._label_print_profile(), copies=copies)
             return barcode, copies
 
         self._run_in_background(
@@ -676,12 +1168,7 @@ class PackingApp(tk.Tk):
                 width_mm=label_w,
                 height_mm=label_h,
             )
-            print_pdf(
-                pdf,
-                sumatra=self.config_data["sumatra"],
-                printer=self.config_data["printer"],
-                print_settings=self.config_data["print_settings"],
-            )
+            print_pdf(pdf, **self._label_print_profile())
             return barcode
 
         self._run_in_background(
@@ -695,14 +1182,18 @@ class SettingsWindow(tk.Toplevel):
     def __init__(self, parent, config: dict[str, str], on_save) -> None:
         super().__init__(parent)
         self.title("Настройки")
-        self.geometry("720x380")
+        self.geometry("760x520")
         self.resizable(True, False)
         self.on_save = on_save
+        label_printer = config.get("printer_label") or config.get("printer", "")
+        label_settings = config.get("print_settings_label") or config.get("print_settings", "")
         self.vars = {
             "server_url": tk.StringVar(value=config.get("server_url", "")),
             "sumatra": tk.StringVar(value=config.get("sumatra", "")),
-            "printer": tk.StringVar(value=config.get("printer", "")),
-            "print_settings": tk.StringVar(value=config.get("print_settings", "")),
+            "printer_a4": tk.StringVar(value=config.get("printer_a4", "")),
+            "print_settings_a4": tk.StringVar(value=config.get("print_settings_a4", "paper=A4,portrait")),
+            "printer_label": tk.StringVar(value=label_printer),
+            "print_settings_label": tk.StringVar(value=label_settings),
             "refresh_seconds": tk.StringVar(value=config.get("refresh_seconds", "30")),
         }
         self._build_ui()
@@ -715,9 +1206,11 @@ class SettingsWindow(tk.Toplevel):
 
         self._row(root, 0, "Адрес сервера", "server_url", "https://example.com")
         self._row(root, 1, "SumatraPDF.exe", "sumatra", r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe", browse=True)
-        self._row(root, 2, "Имя принтера", "printer", "Если пусто, принтер по умолчанию")
-        self._row(root, 3, "Параметры печати", "print_settings", "noscale,portrait,disable-auto-rotation,paper=47mm x 25mm")
-        self._row(root, 4, "Автообновление, сек", "refresh_seconds", "30")
+        self._row(root, 2, "Принтер А4", "printer_a4", "Если пусто — принтер по умолчанию")
+        self._row(root, 3, "Параметры А4", "print_settings_a4", "paper=A4,portrait")
+        self._row(root, 4, "Принтер этикеток", "printer_label", "Если пусто — принтер по умолчанию")
+        self._row(root, 5, "Параметры этикеток", "print_settings_label", "noscale,portrait,disable-auto-rotation,paper=47mm x 25mm")
+        self._row(root, 6, "Автообновление, сек", "refresh_seconds", "30")
 
         hint = ttk.Label(
             root,
@@ -726,13 +1219,13 @@ class SettingsWindow(tk.Toplevel):
                 "Размер этикетки задаётся в paper=ШИРИНАmm x ВЫСОТАmm (например paper=47mm x 25mm). "
                 "Для печати PDF нужен SumatraPDF. Вход выполняется логином и паролем от панели склада."
             ),
-            wraplength=660,
+            wraplength=700,
             foreground="#555",
         )
-        hint.grid(row=5, column=0, columnspan=3, sticky="we", pady=(12, 8))
+        hint.grid(row=7, column=0, columnspan=3, sticky="we", pady=(12, 8))
 
         buttons = ttk.Frame(root)
-        buttons.grid(row=6, column=0, columnspan=3, sticky="e")
+        buttons.grid(row=8, column=0, columnspan=3, sticky="e")
         ttk.Button(buttons, text="Отмена", command=self.destroy).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="Сохранить", command=self.save).pack(side=tk.RIGHT, padx=8)
 
@@ -757,6 +1250,8 @@ class SettingsWindow(tk.Toplevel):
 
     def save(self) -> None:
         config = {key: var.get().strip() for key, var in self.vars.items()}
+        config["printer"] = config.get("printer_label", "")
+        config["print_settings"] = config.get("print_settings_label", "")
         try:
             seconds = int(config.get("refresh_seconds") or "30")
             if seconds < 5:
@@ -774,6 +1269,7 @@ class SettingsWindow(tk.Toplevel):
 
 
 def main() -> None:
+    _configure_windows_dpi_awareness()
     login = LoginWindow()
     login.mainloop()
     if login.client is None:

@@ -78,6 +78,35 @@ class WarehouseApiClient:
         )
         return resp.content
 
+    def get_my_tasks(self) -> list[dict]:
+        resp = self._request("GET", "/api/warehouse/tasks/my", timeout=30)
+        return resp.json().get("tasks") or []
+
+    def get_task(self, task_id: int) -> dict:
+        resp = self._request("GET", f"/api/warehouse/tasks/{int(task_id)}", timeout=30)
+        return resp.json().get("task") or {}
+
+    def get_task_statuses(self) -> list[dict]:
+        resp = self._request("GET", "/api/warehouse/tasks/statuses", timeout=20)
+        return resp.json().get("task_statuses") or []
+
+    def patch_task(self, task_id: int, body: dict) -> dict:
+        resp = self._request(
+            "PATCH",
+            f"/api/warehouse/tasks/{int(task_id)}",
+            json=body,
+            timeout=30,
+        )
+        return resp.json().get("task") or {}
+
+    def download_task_attachment(self, task_id: int, attachment_id: int) -> bytes:
+        resp = self._request(
+            "GET",
+            f"/api/warehouse/tasks/{int(task_id)}/attachments/{int(attachment_id)}",
+            timeout=120,
+        )
+        return resp.content
+
     def search_catalog_products(self, q: str | None = None) -> list[dict]:
         params: dict[str, str] = {}
         if q is not None and q.strip():

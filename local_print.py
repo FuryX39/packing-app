@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import io
-import os
-import subprocess
-import tempfile
+import re
 import threading
-from pathlib import Path
+from typing import Any
 
 from barcode import Code128
 from barcode.writer import ImageWriter
@@ -22,69 +20,199 @@ TEXT_SIDE_MARGIN_MM = 1.2
 NAME_MAX_LINES = 2
 
 
-def _multiply_pdf_pages(pdf_bytes: bytes, copies: int) -> bytes:
-    """Один PDF с N одинаковыми страницами — одно задание на принтер."""
-    if copies <= 1:
-        return pdf_bytes
-    from pypdf import PdfReader, PdfWriter
+_PRINT_LOCK = threading.Lock()
+_PAPER_MM_RE = re.compile(
+    r"paper\s*=\s*([\d.]+)\s*mm\s*x\s*([\d.]+)\s*mm",
+    re.IGNORECASE,
+)
+_HORZRES = 8
+_VERTRES = 10
+_LOGPIXELSX = 88
+_LOGPIXELSY = 90
 
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    if not reader.pages:
-        raise ValueError("Empty PDF")
-    page = reader.pages[0]
-    writer = PdfWriter()
-    for _ in range(copies):
-        writer.add_page(page)
-    out = io.BytesIO()
-    writer.write(out)
-    return out.getvalue()
+
+def _parse_print_settings(print_settings: str) -> dict[str, Any]:
+    raw = str(print_settings or "")
+    folded = raw.casefold()
+    landscape = "landscape" in folded
+    noscale = "noscale" in folded
+    paper = "default"
+    width_mm: float | None = None
+    height_mm: float | None = None
+    if re.search(r"paper\s*=\s*a4\b", folded):
+        paper = "a4"
+        width_mm, height_mm = 210.0, 297.0
+    else:
+        match = _PAPER_MM_RE.search(raw)
+        if match:
+            paper = "custom"
+            width_mm = float(match.group(1))
+            height_mm = float(match.group(2))
+    return {
+        "landscape": landscape,
+        "noscale": noscale,
+        "paper": paper,
+        "width_mm": width_mm,
+        "height_mm": height_mm,
+    }
+
+
+def _rasterize_pdf(pdf_bytes: bytes, *, dpi: int) -> list[tuple[Image.Image, tuple[float, float]]]:
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(pdf_bytes)
+    try:
+        if len(doc) == 0:
+            raise ValueError("Empty PDF")
+        scale = max(72, int(dpi)) / 72.0
+        pages: list[tuple[Image.Image, tuple[float, float]]] = []
+        for index in range(len(doc)):
+            page = doc[index]
+            width_pt, height_pt = page.get_size()
+            bitmap = page.render(scale=scale, rotation=0)
+            image = bitmap.to_pil().convert("RGB")
+            pages.append((image, (float(width_pt), float(height_pt))))
+        return pages
+    finally:
+        doc.close()
+
+
+def _resolve_printer(name: str) -> str:
+    import win32print
+
+    printers = [
+        item[2]
+        for item in win32print.EnumPrinters(
+            win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+        )
+    ]
+    wanted = (name or "").strip()
+    if not wanted:
+        return win32print.GetDefaultPrinter()
+    for item in printers:
+        if item.casefold() == wanted.casefold():
+            return item
+    raise FileNotFoundError(f"Принтер не найден: {name}")
+
+
+def _apply_devmode(devmode, options: dict[str, Any]) -> None:
+    import win32con
+
+    if options["landscape"]:
+        devmode.Orientation = win32con.DMORIENT_LANDSCAPE
+    else:
+        devmode.Orientation = win32con.DMORIENT_PORTRAIT
+    paper = options["paper"]
+    width_mm = options["width_mm"]
+    height_mm = options["height_mm"]
+    if paper == "a4":
+        devmode.PaperSize = win32con.DMPAPER_A4
+        return
+    if paper == "custom" and width_mm and height_mm:
+        w_tenths = max(1, int(round(float(width_mm) * 10)))
+        h_tenths = max(1, int(round(float(height_mm) * 10)))
+        if options["landscape"] and h_tenths > w_tenths:
+            w_tenths, h_tenths = h_tenths, w_tenths
+        devmode.PaperSize = getattr(win32con, "DMPAPER_USER", 256)
+        devmode.PaperWidth = w_tenths
+        devmode.PaperLength = h_tenths
+
+
+def _dest_rect(
+    image: Image.Image,
+    page_pts: tuple[float, float],
+    printable: tuple[int, int],
+    dpi: tuple[int, int],
+    *,
+    noscale: bool,
+) -> tuple[int, int, int, int]:
+    area_w, area_h = printable
+    if area_w <= 0 or area_h <= 0:
+        return (0, 0, image.width, image.height)
+    img_w, img_h = image.size
+    if noscale:
+        page_w_pt, page_h_pt = page_pts
+        draw_w = int(round(page_w_pt / 72.0 * dpi[0])) if page_w_pt else img_w
+        draw_h = int(round(page_h_pt / 72.0 * dpi[1])) if page_h_pt else img_h
+    else:
+        scale = min(area_w / img_w, area_h / img_h)
+        draw_w = max(1, int(round(img_w * scale)))
+        draw_h = max(1, int(round(img_h * scale)))
+    if draw_w > area_w or draw_h > area_h:
+        scale = min(area_w / max(draw_w, 1), area_h / max(draw_h, 1))
+        draw_w = max(1, int(round(draw_w * scale)))
+        draw_h = max(1, int(round(draw_h * scale)))
+    x = max(0, (area_w - draw_w) // 2)
+    y = max(0, (area_h - draw_h) // 2)
+    return (x, y, x + draw_w, y + draw_h)
+
+
+def _gdi_print_pages(
+    pages: list[tuple[Image.Image, tuple[float, float]]],
+    *,
+    printer: str,
+    copies: int,
+    options: dict[str, Any],
+) -> None:
+    import win32gui
+    import win32print
+    import win32ui
+    from PIL import ImageWin
+
+    printer_name = _resolve_printer(printer)
+    handle = win32print.OpenPrinter(printer_name)
+    try:
+        devmode = win32print.GetPrinter(handle, 2).get("pDevMode")
+        if devmode is not None:
+            _apply_devmode(devmode, options)
+            hdc_handle = win32gui.CreateDC("WINSPOOL", printer_name, devmode)
+        else:
+            hdc_handle = win32gui.CreateDC("WINSPOOL", printer_name, None)
+    finally:
+        win32print.ClosePrinter(handle)
+
+    dc = win32ui.CreateDCFromHandle(hdc_handle)
+    try:
+        area = (int(dc.GetDeviceCaps(_HORZRES)), int(dc.GetDeviceCaps(_VERTRES)))
+        dpi = (int(dc.GetDeviceCaps(_LOGPIXELSX) or 203), int(dc.GetDeviceCaps(_LOGPIXELSY) or 203))
+        dc.StartDoc("Warehouse packing")
+        try:
+            for _copy in range(copies):
+                for image, page_pts in pages:
+                    dc.StartPage()
+                    dib = ImageWin.Dib(image)
+                    dib.draw(dc.GetHandleOutput(), _dest_rect(image, page_pts, area, dpi, noscale=options["noscale"]))
+                    dc.EndPage()
+        finally:
+            dc.EndDoc()
+    finally:
+        dc.DeleteDC()
 
 
 def print_pdf(
     pdf_bytes: bytes,
     *,
-    sumatra: str,
     printer: str = "",
     print_settings: str = "",
     copies: int = 1,
+    sumatra: str = "",
+    **_unused: Any,
 ) -> None:
+    """Тихая печать PDF через Windows GDI, без SumatraPDF."""
     if not pdf_bytes:
         raise ValueError("Empty PDF")
     count = max(1, min(9999, int(copies)))
-    exe = Path(sumatra)
-    if not exe.is_file():
-        raise FileNotFoundError(f"SumatraPDF not found: {sumatra}")
-    payload = _multiply_pdf_pages(pdf_bytes, count)
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(payload)
-        path = Path(tmp.name)
-    cmd = [str(exe), "-silent", "-exit-when-done"]
-    if printer:
-        cmd.extend(["-print-to", printer])
-    else:
-        cmd.append("-print-to-default")
-    if print_settings:
-        cmd.extend(["-print-settings", print_settings])
-    cmd.append(str(path))
-
-    popen_kwargs: dict = {
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-    }
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-    proc = subprocess.Popen(cmd, **popen_kwargs)
-
-    def _wait_and_cleanup(process=proc, file_path=path) -> None:
-        try:
-            process.wait(timeout=max(90, count * 2))
-        except subprocess.TimeoutExpired:
-            process.kill()
-        finally:
-            file_path.unlink(missing_ok=True)
-
-    threading.Thread(target=_wait_and_cleanup, daemon=True).start()
+    options = _parse_print_settings(print_settings)
+    dpi = 200 if options["paper"] == "a4" else 300
+    try:
+        pages = _rasterize_pdf(pdf_bytes, dpi=dpi)
+    except ImportError as exc:
+        raise RuntimeError("Установите pypdfium2: pip install pypdfium2") from exc
+    try:
+        with _PRINT_LOCK:
+            _gdi_print_pages(pages, printer=printer, copies=count, options=options)
+    except ImportError as exc:
+        raise RuntimeError("Установите pywin32: pip install pywin32") from exc
 
 
 def _trim_barcode_whitespace(img: Image.Image) -> Image.Image:

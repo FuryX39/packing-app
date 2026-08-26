@@ -90,6 +90,12 @@ class FbsPackingMixin:
             variable=self.fbs_manual_var,
             command=self._fbs_toggle_manual,
         ).pack(side=tk.LEFT)
+        self.fbs_batch_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            mode_row,
+            text="Печатать все ярлыки SKU сразу",
+            variable=self.fbs_batch_var,
+        ).pack(side=tk.LEFT, padx=(16, 0))
 
         self.fbs_manual_frame = ttk.Frame(right)
         # packed when manual on
@@ -232,12 +238,25 @@ class FbsPackingMixin:
         self.fbs_job_stats.config(text=f"готово {done}/{total} · осталось {pending} · в печати {printed}")
 
         active = job.get("active_line")
-        if active:
-            self.fbs_active_var.set(
-                f"SKU {active.get('sku')} · {active.get('product_name') or ''} · "
-                f"заказ {active.get('order_display') or active.get('order_id')} · "
-                f"строка #{active.get('id')}"
-            )
+        active_lines = job.get("active_lines") or ([] if not active else [active])
+        if active_lines:
+            first = active_lines[0]
+            if len(active_lines) == 1:
+                self.fbs_active_var.set(
+                    f"SKU {first.get('sku')} · {first.get('product_name') or ''} · "
+                    f"заказ {first.get('order_display') or first.get('order_id')} · "
+                    f"строка #{first.get('id')}"
+                )
+            else:
+                orders = ", ".join(
+                    str(item.get("order_display") or item.get("order_id") or "?")
+                    for item in active_lines
+                )
+                self.fbs_active_var.set(
+                    f"SKU {first.get('sku')} · {first.get('product_name') or ''} · "
+                    f"в печати {len(active_lines)} шт. · заказы: {orders} · "
+                    f"пропикайте ярлыки подряд"
+                )
         else:
             self.fbs_active_var.set("Нет активной строки — пикните товар")
 
@@ -327,9 +346,10 @@ class FbsPackingMixin:
         sku = str(group.get("sku") or "")
         raw_pid = group.get("product_id")
         product_id = int(raw_pid) if raw_pid not in (None, "") else None
+        batch = bool(self.fbs_batch_var.get())
 
         def worker():
-            return self.client.fbs_pick_sku(job_id, sku=sku, product_id=product_id)
+            return self.client.fbs_pick_sku(job_id, sku=sku, product_id=product_id, batch=batch)
 
         self._fbs_handle_allocate(worker, status="Выделение SKU...")
 
@@ -343,7 +363,7 @@ class FbsPackingMixin:
             messagebox.showwarning("FBS", "Сначала откройте задание")
             return
         job_id = int(job["id"])
-        active = job.get("active_line")
+        active = job.get("active_line") or (job.get("active_lines") or [None])[0]
 
         if active:
             def worker():
@@ -352,57 +372,83 @@ class FbsPackingMixin:
             def on_ok(payload: dict) -> None:
                 self.fbs_job = payload.get("job") or self.fbs_job
                 self._fbs_render_job()
-                self.set_status("Ярлык принят, строка закрыта")
+                left = len((self.fbs_job or {}).get("active_lines") or [])
+                if left:
+                    self.set_status(f"Ярлык принят · осталось пропикать: {left}")
+                else:
+                    self.set_status("Ярлык принят, строка закрыта")
                 self._fbs_focus_scan()
 
             self._fbs_run(worker, on_ok, status="Сверка ярлыка...")
             return
 
+        batch = bool(self.fbs_batch_var.get())
+
         def worker_product():
-            return self.client.fbs_scan_product(job_id, code)
+            return self.client.fbs_scan_product(job_id, code, batch=batch)
 
         self._fbs_handle_allocate(worker_product, status="Пик товара...")
 
     def _fbs_handle_allocate(self, worker: Callable[[], dict], *, status: str) -> None:
         def on_ok(payload: dict) -> None:
             self.fbs_job = payload.get("job") or self.fbs_job
-            pdf_b64 = payload.get("pdf_base64") or ""
-            line = payload.get("line") or {}
+            pdfs = payload.get("pdfs_base64") or []
+            if not pdfs and payload.get("pdf_base64"):
+                pdfs = [payload.get("pdf_base64")]
+            lines = payload.get("lines") or ([payload.get("line")] if payload.get("line") else [])
             self._fbs_render_job()
-            if pdf_b64:
-                try:
-                    pdf = base64.b64decode(pdf_b64)
-                    print_pdf(pdf, **self._label_print_profile())
-                    self.set_status(f"Напечатан ярлык · SKU {line.get('sku')} · заказ {line.get('order_id')}")
-                except Exception as exc:
-                    messagebox.showerror("Печать", str(exc))
-                    self.set_status("Ярлык получен, печать не удалась — Перепечатать")
+            printed = 0
+            try:
+                for pdf_b64 in pdfs:
+                    print_pdf(base64.b64decode(pdf_b64), **self._label_print_profile())
+                    printed += 1
+            except Exception as exc:
+                messagebox.showerror("Печать", str(exc))
+                self.set_status(
+                    f"Получено ярлыков: {len(pdfs)}, напечатано: {printed}. Можно Перепечатать"
+                )
+                self._fbs_focus_scan()
+                return
+            sku = (lines[0] or {}).get("sku") if lines else ""
+            if printed > 1:
+                self.set_status(f"Напечатано ярлыков: {printed} · SKU {sku} · пропикайте ярлыки подряд")
+            elif printed == 1:
+                line = lines[0] if lines else {}
+                self.set_status(f"Напечатан ярлык · SKU {line.get('sku')} · заказ {line.get('order_id')}")
             else:
                 self.set_status("Строка выделена")
             self._fbs_focus_scan()
 
         self._fbs_run(worker, on_ok, status=status)
 
-    def _fbs_active_line(self) -> dict | None:
+    def _fbs_active_lines(self) -> list[dict]:
         job = self.fbs_job or {}
+        lines = job.get("active_lines")
+        if isinstance(lines, list) and lines:
+            return [item for item in lines if isinstance(item, dict)]
         active = job.get("active_line")
-        return active if isinstance(active, dict) else None
+        return [active] if isinstance(active, dict) else []
+
+    def _fbs_active_line(self) -> dict | None:
+        lines = self._fbs_active_lines()
+        return lines[0] if lines else None
 
     def fbs_reprint_active(self) -> None:
         job = self.fbs_job
-        active = self._fbs_active_line()
-        if not job or not active:
+        actives = self._fbs_active_lines()
+        if not job or not actives:
             messagebox.showwarning("FBS", "Нет активной строки")
             return
         job_id = int(job["id"])
-        line_id = int(active["id"])
+        line_ids = [int(item["id"]) for item in actives]
 
         def worker():
-            return self.client.fbs_download_line_pdf(job_id, line_id)
+            return [self.client.fbs_download_line_pdf(job_id, line_id) for line_id in line_ids]
 
-        def on_ok(pdf: bytes) -> None:
-            print_pdf(pdf, **self._label_print_profile())
-            self.set_status("Ярлык отправлен на повторную печать")
+        def on_ok(pdfs: list[bytes]) -> None:
+            for pdf in pdfs:
+                print_pdf(pdf, **self._label_print_profile())
+            self.set_status(f"На повторную печать: {len(pdfs)} ярл.")
             self._fbs_focus_scan()
 
         self._fbs_run(worker, on_ok, status="Перепечатка...")
@@ -422,7 +468,11 @@ class FbsPackingMixin:
         def on_ok(payload: dict) -> None:
             self.fbs_job = payload.get("job") or self.fbs_job
             self._fbs_render_job()
-            self.set_status("Строка закрыта вручную")
+            left = len(self._fbs_active_lines())
+            if left:
+                self.set_status(f"Строка закрыта вручную · осталось в печати: {left}")
+            else:
+                self.set_status("Строка закрыта вручную")
             self._fbs_focus_scan()
 
         self._fbs_run(worker, on_ok, status="Закрытие...")
@@ -442,7 +492,7 @@ class FbsPackingMixin:
         def on_ok(payload: dict) -> None:
             self.fbs_job = payload.get("job") or self.fbs_job
             self._fbs_render_job()
-            self.set_status("Печать отменена, строка снова pending")
+            self.set_status("Печать отменена, строки снова pending")
             self._fbs_focus_scan()
 
         self._fbs_run(worker, on_ok, status="Отмена...")

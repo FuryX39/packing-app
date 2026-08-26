@@ -3,4 +3,5 @@ python-dotenv
 python-barcode
 reportlab
 Pillow
-pypdf>=5.0.0
+pypdfium2
+pywin32

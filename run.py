@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 from datetime import date, timedelta
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 import os
 import ctypes
 
@@ -453,7 +453,6 @@ class PackingApp(FbsPackingMixin, tk.Tk):
 
     def _label_print_profile(self) -> dict[str, str]:
         return {
-            "sumatra": self.config_data["sumatra"],
             "printer": self.config_data.get("printer_label") or self.config_data.get("printer", ""),
             "print_settings": self.config_data.get("print_settings_label")
             or self.config_data.get("print_settings", ""),
@@ -461,7 +460,6 @@ class PackingApp(FbsPackingMixin, tk.Tk):
 
     def _a4_print_profile(self) -> dict[str, str]:
         return {
-            "sumatra": self.config_data["sumatra"],
             "printer": self.config_data.get("printer_a4", ""),
             "print_settings": self.config_data.get("print_settings_a4", "paper=A4,portrait"),
         }
@@ -1219,7 +1217,6 @@ class SettingsWindow(tk.Toplevel):
         self.vars = {
             "server_url": tk.StringVar(value=config.get("server_url", "")),
             "api_url": tk.StringVar(value=config.get("api_url", "")),
-            "sumatra": tk.StringVar(value=config.get("sumatra", "")),
             "printer_a4": tk.StringVar(value=config.get("printer_a4", "")),
             "print_settings_a4": tk.StringVar(value=config.get("print_settings_a4", "paper=A4,portrait")),
             "printer_label": tk.StringVar(value=label_printer),
@@ -1236,49 +1233,37 @@ class SettingsWindow(tk.Toplevel):
 
         self._row(root, 0, "Адрес сервера (веб)", "server_url", "http://127.0.0.1:8765")
         self._row(root, 1, "Адрес API (упаковка)", "api_url", "пусто = тот же хост :8766")
-        self._row(root, 2, "SumatraPDF.exe", "sumatra", r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe", browse=True)
-        self._row(root, 3, "Принтер А4", "printer_a4", "Если пусто — принтер по умолчанию")
-        self._row(root, 4, "Параметры А4", "print_settings_a4", "paper=A4,portrait")
-        self._row(root, 5, "Принтер этикеток", "printer_label", "Если пусто — принтер по умолчанию")
-        self._row(root, 6, "Параметры этикеток", "print_settings_label", "noscale,portrait,disable-auto-rotation,paper=47mm x 25mm")
-        self._row(root, 7, "Автообновление, сек", "refresh_seconds", "30")
+        self._row(root, 2, "Принтер А4", "printer_a4", "Если пусто — принтер по умолчанию")
+        self._row(root, 3, "Параметры А4", "print_settings_a4", "paper=A4,portrait")
+        self._row(root, 4, "Принтер этикеток", "printer_label", "Если пусто — принтер по умолчанию")
+        self._row(root, 5, "Параметры этикеток", "print_settings_label", "noscale,portrait,disable-auto-rotation,paper=47mm x 25mm")
+        self._row(root, 6, "Автообновление, сек", "refresh_seconds", "30")
 
         hint = ttk.Label(
             root,
             text=(
                 "Настройки сохраняются в config.env рядом с приложением. "
-                "Веб — run_web.py (задачи, каталог). API — run_api.py (FBS-упаковка), обычно порт 8766. "
-                "Размер этикетки: paper=ШИРИНАmm x ВЫСОТАmm. Для печати PDF нужен SumatraPDF."
+                "Веб — run_web.py (задачи, каталог). API — run_api.py (FBS-упаковка). "
+                "Печать тихая через Windows, SumatraPDF не нужен. "
+                "Размер этикетки: paper=ШИРИНАmm x ВЫСОТАmm."
             ),
             wraplength=700,
             foreground="#555",
         )
-        hint.grid(row=8, column=0, columnspan=3, sticky="we", pady=(12, 8))
+        hint.grid(row=7, column=0, columnspan=3, sticky="we", pady=(12, 8))
 
         buttons = ttk.Frame(root)
-        buttons.grid(row=9, column=0, columnspan=3, sticky="e")
+        buttons.grid(row=8, column=0, columnspan=3, sticky="e")
         ttk.Button(buttons, text="Отмена", command=self.destroy).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="Сохранить", command=self.save).pack(side=tk.RIGHT, padx=8)
 
         root.columnconfigure(1, weight=1)
-        self.geometry("760x560")
+        self.geometry("760x520")
 
-    def _row(self, root, row: int, label: str, key: str, placeholder: str = "", *, browse: bool = False) -> None:
+    def _row(self, root, row: int, label: str, key: str, placeholder: str = "") -> None:
         ttk.Label(root, text=label).grid(row=row, column=0, sticky="w", pady=5, padx=(0, 8))
-        entry = ttk.Entry(root, textvariable=self.vars[key])
-        entry.grid(row=row, column=1, sticky="we", pady=5)
-        if browse:
-            ttk.Button(root, text="Выбрать…", command=lambda: self.browse_file(key)).grid(row=row, column=2, padx=(8, 0))
-        else:
-            ttk.Label(root, text="").grid(row=row, column=2)
-
-    def browse_file(self, key: str) -> None:
-        path = filedialog.askopenfilename(
-            title="Выберите SumatraPDF.exe",
-            filetypes=[("Executable", "*.exe"), ("All files", "*.*")],
-        )
-        if path:
-            self.vars[key].set(path)
+        ttk.Entry(root, textvariable=self.vars[key]).grid(row=row, column=1, sticky="we", pady=5)
+        ttk.Label(root, text="").grid(row=row, column=2)
 
     def save(self) -> None:
         config = {key: var.get().strip() for key, var in self.vars.items()}

@@ -252,17 +252,24 @@ class WarehouseApiClient:
         resp = self._api_request("GET", f"/api/v1/fbs-packing/jobs/{int(job_id)}/pack", timeout=30)
         return resp.json().get("job") or {}
 
-    def fbs_scan_product(self, job_id: int, barcode: str) -> dict[str, Any]:
+    def fbs_scan_product(self, job_id: int, barcode: str, *, batch: bool = False) -> dict[str, Any]:
         resp = self._api_request(
             "POST",
             f"/api/v1/fbs-packing/jobs/{int(job_id)}/scan-product",
-            json={"barcode": barcode},
+            json={"barcode": barcode, "batch": bool(batch)},
             timeout=60,
         )
         return resp.json()
 
-    def fbs_pick_sku(self, job_id: int, *, sku: str = "", product_id: int | None = None) -> dict[str, Any]:
-        body: dict[str, Any] = {"sku": sku}
+    def fbs_pick_sku(
+        self,
+        job_id: int,
+        *,
+        sku: str = "",
+        product_id: int | None = None,
+        batch: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"sku": sku, "batch": bool(batch)}
         if product_id is not None:
             body["product_id"] = int(product_id)
         resp = self._api_request(

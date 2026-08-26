@@ -11,6 +11,7 @@ CONFIG_PATH = ROOT / "config.env"
 
 DEFAULT_CONFIG = {
     "server_url": "",
+    "api_url": "",
     "sumatra": r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe",
     "printer": "",
     "print_settings": "noscale,portrait,disable-auto-rotation,paper=47mm x 25mm",
@@ -23,6 +24,7 @@ DEFAULT_CONFIG = {
 
 ENV_KEYS = {
     "server_url": "WAREHOUSE_SERVER_URL",
+    "api_url": "WAREHOUSE_API_URL",
     "sumatra": "BARCODE_PRINT_SUMATRA",
     "printer": "BARCODE_PRINT_PRINTER",
     "print_settings": "BARCODE_PRINT_SETTINGS",
@@ -46,6 +48,7 @@ def load_config() -> dict[str, str]:
     ).strip()
     return {
         "server_url": (os.getenv("WAREHOUSE_SERVER_URL") or DEFAULT_CONFIG["server_url"]).strip().rstrip("/"),
+        "api_url": (os.getenv("WAREHOUSE_API_URL") or DEFAULT_CONFIG["api_url"]).strip().rstrip("/"),
         "sumatra": (os.getenv("BARCODE_PRINT_SUMATRA") or DEFAULT_CONFIG["sumatra"]).strip(),
         "printer": printer,
         "print_settings": print_settings,

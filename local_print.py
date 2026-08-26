@@ -95,6 +95,11 @@ def _trim_barcode_whitespace(img: Image.Image) -> Image.Image:
     return img.crop(bbox)
 
 
+def render_code128_image(barcode_value: str) -> Image.Image:
+    """Публичная отрисовка Code128 для экрана ручной сборки."""
+    return _render_code128_image(barcode_value)
+
+
 def _render_code128_image(barcode_value: str) -> Image.Image:
     writer = ImageWriter()
     buf = io.BytesIO()

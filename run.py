@@ -8,6 +8,7 @@ import os
 import ctypes
 
 from api_client import AuthError, WarehouseApiClient
+from fbs_packing_ui import FbsPackingMixin
 from local_print import barcode_label_pdf, print_pdf
 from packing_config import load_config, parse_label_size_mm, save_config
 
@@ -106,7 +107,7 @@ class LoginWindow(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Warehouse Packing App — вход")
-        self.geometry("480x260")
+        self.geometry("520x320")
         self.resizable(False, False)
         self.config_data = load_config()
         self.client: WarehouseApiClient | None = None
@@ -125,20 +126,28 @@ class LoginWindow(tk.Tk):
         self.server_var = tk.StringVar(value=self.config_data.get("server_url", ""))
         ttk.Entry(root, textvariable=self.server_var, width=42).grid(row=1, column=1, sticky="we", pady=4)
 
-        ttk.Label(root, text="Логин").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(root, text="Адрес API").grid(row=2, column=0, sticky="w", pady=4)
+        self.api_var = tk.StringVar(value=self.config_data.get("api_url", ""))
+        api_entry = ttk.Entry(root, textvariable=self.api_var, width=42)
+        api_entry.grid(row=2, column=1, sticky="we", pady=4)
+        ttk.Label(root, text="пусто = тот же хост :8766 (run_api.py)", foreground="#666").grid(
+            row=3, column=1, sticky="w"
+        )
+
+        ttk.Label(root, text="Логин").grid(row=4, column=0, sticky="w", pady=4)
         self.login_var = tk.StringVar()
         login_entry = ttk.Entry(root, textvariable=self.login_var, width=42)
-        login_entry.grid(row=2, column=1, sticky="we", pady=4)
+        login_entry.grid(row=4, column=1, sticky="we", pady=4)
 
-        ttk.Label(root, text="Пароль").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Label(root, text="Пароль").grid(row=5, column=0, sticky="w", pady=4)
         self.password_var = tk.StringVar()
-        ttk.Entry(root, textvariable=self.password_var, show="*", width=42).grid(row=3, column=1, sticky="we", pady=4)
+        ttk.Entry(root, textvariable=self.password_var, show="*", width=42).grid(row=5, column=1, sticky="we", pady=4)
 
         self.status = ttk.Label(root, text="", foreground="#555")
-        self.status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.status.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         buttons = ttk.Frame(root)
-        buttons.grid(row=5, column=0, columnspan=2, sticky="e", pady=(16, 0))
+        buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(16, 0))
         ttk.Button(buttons, text="Настройки", command=self.open_settings).pack(side=tk.LEFT)
         ttk.Button(buttons, text="Войти", command=self.do_login).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="Выход", command=self.destroy).pack(side=tk.RIGHT, padx=8)
@@ -158,10 +167,12 @@ class LoginWindow(tk.Tk):
         save_config(config)
         self.config_data = load_config()
         self.server_var.set(self.config_data.get("server_url", ""))
+        self.api_var.set(self.config_data.get("api_url", ""))
         self.set_status("Настройки сохранены")
 
     def do_login(self) -> None:
         server_url = self.server_var.get().strip().rstrip("/")
+        api_url = self.api_var.get().strip().rstrip("/")
         login = self.login_var.get().strip()
         password = self.password_var.get()
         if not server_url:
@@ -170,12 +181,16 @@ class LoginWindow(tk.Tk):
         if not login or not password:
             messagebox.showerror("Ошибка", "Введите логин и пароль")
             return
-        if server_url != self.config_data.get("server_url", ""):
-            save_config({**self.config_data, "server_url": server_url})
+        changed = (
+            server_url != self.config_data.get("server_url", "")
+            or api_url != self.config_data.get("api_url", "")
+        )
+        if changed:
+            save_config({**self.config_data, "server_url": server_url, "api_url": api_url})
             self.config_data = load_config()
 
         self.set_status("Вход...")
-        client = WarehouseApiClient(server_url)
+        client = WarehouseApiClient(server_url, api_url)
         try:
             session = client.login(login, password)
         except AuthError as exc:
@@ -187,13 +202,21 @@ class LoginWindow(tk.Tk):
             self.set_status("")
             return
 
+        if not client.api_ok:
+            messagebox.showwarning(
+                "API упаковщиков",
+                (client.api_error or "Нет сессии API")
+                + "\n\nЗадания и номенклатура работают. "
+                "Вкладка «Упаковка FBS» нужна после запуска run_api.py.",
+            )
+
         user = session.get("user") or {}
         self.client = client
         self.user_name = str(user.get("display_name") or user.get("login") or login)
         self.destroy()
 
 
-class PackingApp(tk.Tk):
+class PackingApp(FbsPackingMixin, tk.Tk):
     def __init__(self, config_data: dict[str, str], client: WarehouseApiClient, user_name: str) -> None:
         super().__init__()
         self.title(f"Warehouse Packing App — {user_name}")
@@ -217,6 +240,7 @@ class PackingApp(tk.Tk):
         self._status_id_by_name: dict[str, int] = {}
         self._task_status_silent = False
         self._tasks_refresh_job: str | None = None
+        self._init_fbs_state()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self._configure_catalog_styles()
         self._configure_tasks_styles()
@@ -259,6 +283,7 @@ class PackingApp(tk.Tk):
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=10)
 
         self._build_tasks_tab()
+        self._build_fbs_tab()
         self._build_catalog_tab()
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
@@ -1112,9 +1137,13 @@ class PackingApp(tk.Tk):
         tab_id = self.notebook.select()
         tab_text = self.notebook.tab(tab_id, "text")
         if tab_text == "Номенклатура":
+            self._cancel_tasks_refresh()
             self.load_catalog()
         elif tab_text == "Задания":
             self.load_tasks()
+        elif tab_text == "Упаковка FBS":
+            self._cancel_tasks_refresh()
+            self.load_fbs_jobs()
         else:
             self._cancel_tasks_refresh()
 
@@ -1189,6 +1218,7 @@ class SettingsWindow(tk.Toplevel):
         label_settings = config.get("print_settings_label") or config.get("print_settings", "")
         self.vars = {
             "server_url": tk.StringVar(value=config.get("server_url", "")),
+            "api_url": tk.StringVar(value=config.get("api_url", "")),
             "sumatra": tk.StringVar(value=config.get("sumatra", "")),
             "printer_a4": tk.StringVar(value=config.get("printer_a4", "")),
             "print_settings_a4": tk.StringVar(value=config.get("print_settings_a4", "paper=A4,portrait")),
@@ -1204,32 +1234,34 @@ class SettingsWindow(tk.Toplevel):
         root = ttk.Frame(self, padding=12)
         root.pack(fill=tk.BOTH, expand=True)
 
-        self._row(root, 0, "Адрес сервера", "server_url", "https://example.com")
-        self._row(root, 1, "SumatraPDF.exe", "sumatra", r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe", browse=True)
-        self._row(root, 2, "Принтер А4", "printer_a4", "Если пусто — принтер по умолчанию")
-        self._row(root, 3, "Параметры А4", "print_settings_a4", "paper=A4,portrait")
-        self._row(root, 4, "Принтер этикеток", "printer_label", "Если пусто — принтер по умолчанию")
-        self._row(root, 5, "Параметры этикеток", "print_settings_label", "noscale,portrait,disable-auto-rotation,paper=47mm x 25mm")
-        self._row(root, 6, "Автообновление, сек", "refresh_seconds", "30")
+        self._row(root, 0, "Адрес сервера (веб)", "server_url", "http://127.0.0.1:8765")
+        self._row(root, 1, "Адрес API (упаковка)", "api_url", "пусто = тот же хост :8766")
+        self._row(root, 2, "SumatraPDF.exe", "sumatra", r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe", browse=True)
+        self._row(root, 3, "Принтер А4", "printer_a4", "Если пусто — принтер по умолчанию")
+        self._row(root, 4, "Параметры А4", "print_settings_a4", "paper=A4,portrait")
+        self._row(root, 5, "Принтер этикеток", "printer_label", "Если пусто — принтер по умолчанию")
+        self._row(root, 6, "Параметры этикеток", "print_settings_label", "noscale,portrait,disable-auto-rotation,paper=47mm x 25mm")
+        self._row(root, 7, "Автообновление, сек", "refresh_seconds", "30")
 
         hint = ttk.Label(
             root,
             text=(
                 "Настройки сохраняются в config.env рядом с приложением. "
-                "Размер этикетки задаётся в paper=ШИРИНАmm x ВЫСОТАmm (например paper=47mm x 25mm). "
-                "Для печати PDF нужен SumatraPDF. Вход выполняется логином и паролем от панели склада."
+                "Веб — run_web.py (задачи, каталог). API — run_api.py (FBS-упаковка), обычно порт 8766. "
+                "Размер этикетки: paper=ШИРИНАmm x ВЫСОТАmm. Для печати PDF нужен SumatraPDF."
             ),
             wraplength=700,
             foreground="#555",
         )
-        hint.grid(row=7, column=0, columnspan=3, sticky="we", pady=(12, 8))
+        hint.grid(row=8, column=0, columnspan=3, sticky="we", pady=(12, 8))
 
         buttons = ttk.Frame(root)
-        buttons.grid(row=8, column=0, columnspan=3, sticky="e")
+        buttons.grid(row=9, column=0, columnspan=3, sticky="e")
         ttk.Button(buttons, text="Отмена", command=self.destroy).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="Сохранить", command=self.save).pack(side=tk.RIGHT, padx=8)
 
         root.columnconfigure(1, weight=1)
+        self.geometry("760x560")
 
     def _row(self, root, row: int, label: str, key: str, placeholder: str = "", *, browse: bool = False) -> None:
         ttk.Label(root, text=label).grid(row=row, column=0, sticky="w", pady=5, padx=(0, 8))

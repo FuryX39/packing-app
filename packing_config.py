@@ -20,6 +20,7 @@ DEFAULT_CONFIG = {
     "printer_label": "",
     "print_settings_label": "noscale,portrait,disable-auto-rotation,paper=47mm x 25mm",
     "refresh_seconds": "30",
+    "fbs_skip_mp_confirm": "0",
 }
 
 ENV_KEYS = {
@@ -33,6 +34,7 @@ ENV_KEYS = {
     "printer_label": "BARCODE_PRINT_PRINTER_LABEL",
     "print_settings_label": "BARCODE_PRINT_SETTINGS_LABEL",
     "refresh_seconds": "REFRESH_SECONDS",
+    "fbs_skip_mp_confirm": "FBS_SKIP_MP_CONFIRM",
 }
 
 
@@ -59,6 +61,9 @@ def load_config() -> dict[str, str]:
         "printer_label": printer_label,
         "print_settings_label": print_settings_label,
         "refresh_seconds": (os.getenv("REFRESH_SECONDS") or DEFAULT_CONFIG["refresh_seconds"]).strip(),
+        "fbs_skip_mp_confirm": (
+            os.getenv("FBS_SKIP_MP_CONFIRM") or DEFAULT_CONFIG["fbs_skip_mp_confirm"]
+        ).strip(),
     }
 
 

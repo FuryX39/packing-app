@@ -32,7 +32,7 @@ _FBS_LINE_STATUS_RU = {
     "printed": "Печать",
     "done": "Готово",
 }
-_FBS_JOBS_SASH_PX = 160
+_FBS_JOBS_MIN_PX = 240
 _FBS_BARCODE_W = 180
 _FBS_BARCODE_H = 80
 _FBS_ACTIVE_IMG = 110
@@ -164,11 +164,15 @@ class FbsPackingMixin:
         panes.pack(fill=tk.BOTH, expand=True)
         self.fbs_panes = panes
 
-        left = ttk.Frame(panes)
+        left = ttk.Frame(panes, width=_FBS_JOBS_MIN_PX)
         right = ttk.Frame(panes)
         panes.add(left, weight=1)
-        panes.add(right, weight=8)
-        self.after(80, self._fbs_shrink_jobs_pane)
+        panes.add(right, weight=5)
+        try:
+            panes.pane(left, minsize=_FBS_JOBS_MIN_PX, weight=1)
+            panes.pane(right, minsize=480, weight=5)
+        except tk.TclError:
+            pass
 
         ttk.Label(left, text="Мои задания FBS").pack(anchor=tk.W)
         self.fbs_jobs_tree = ttk.Treeview(
@@ -180,9 +184,9 @@ class FbsPackingMixin:
         self.fbs_jobs_tree.heading("id", text="№")
         self.fbs_jobs_tree.heading("status", text="Статус")
         self.fbs_jobs_tree.heading("progress", text="Готово")
-        self.fbs_jobs_tree.column("id", width=36, stretch=False, minwidth=32)
-        self.fbs_jobs_tree.column("status", width=72, stretch=False, minwidth=60)
-        self.fbs_jobs_tree.column("progress", width=52, stretch=False, minwidth=44)
+        self.fbs_jobs_tree.column("id", width=44, stretch=False, minwidth=36)
+        self.fbs_jobs_tree.column("status", width=90, stretch=True, minwidth=72)
+        self.fbs_jobs_tree.column("progress", width=64, stretch=False, minwidth=52)
         self.fbs_jobs_tree.pack(fill=tk.BOTH, expand=True)
         self.fbs_jobs_tree.bind("<<TreeviewSelect>>", self.on_fbs_job_select)
         _TreeHoverTip(self.fbs_jobs_tree, self._fbs_jobs_tip)
@@ -331,13 +335,6 @@ class FbsPackingMixin:
         save_config(cfg)
         if self.fbs_job:
             self._fbs_render_job()
-
-    def _fbs_shrink_jobs_pane(self) -> None:
-        try:
-            self.update_idletasks()
-            self.fbs_panes.sashpos(0, _FBS_JOBS_SASH_PX)
-        except Exception:
-            pass
 
     def _fbs_jobs_tip(self, row: str, col: str) -> str:
         values = self.fbs_jobs_tree.item(row, "values") or ()

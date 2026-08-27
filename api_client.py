@@ -252,11 +252,18 @@ class WarehouseApiClient:
         resp = self._api_request("GET", f"/api/v1/fbs-packing/jobs/{int(job_id)}/pack", timeout=30)
         return resp.json().get("job") or {}
 
-    def fbs_scan_product(self, job_id: int, barcode: str, *, batch: bool = False) -> dict[str, Any]:
+    def fbs_scan_product(
+        self,
+        job_id: int,
+        barcode: str,
+        *,
+        batch: bool = False,
+        include_pdf: bool = True,
+    ) -> dict[str, Any]:
         resp = self._api_request(
             "POST",
             f"/api/v1/fbs-packing/jobs/{int(job_id)}/scan-product",
-            json={"barcode": barcode, "batch": bool(batch)},
+            json={"barcode": barcode, "batch": bool(batch), "include_pdf": bool(include_pdf)},
             timeout=60,
         )
         return resp.json()
@@ -268,8 +275,9 @@ class WarehouseApiClient:
         sku: str = "",
         product_id: int | None = None,
         batch: bool = False,
+        include_pdf: bool = True,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"sku": sku, "batch": bool(batch)}
+        body: dict[str, Any] = {"sku": sku, "batch": bool(batch), "include_pdf": bool(include_pdf)}
         if product_id is not None:
             body["product_id"] = int(product_id)
         resp = self._api_request(
@@ -310,5 +318,13 @@ class WarehouseApiClient:
             "GET",
             f"/api/v1/fbs-packing/jobs/{int(job_id)}/lines/{int(line_id)}/label",
             timeout=60,
+        )
+        return resp.content
+
+    def fbs_download_line_labels_zip(self, job_id: int) -> bytes:
+        resp = self._api_request(
+            "GET",
+            f"/api/v1/fbs-packing/jobs/{int(job_id)}/line-labels.zip",
+            timeout=180,
         )
         return resp.content

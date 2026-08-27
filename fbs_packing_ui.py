@@ -8,6 +8,14 @@ from typing import Any, Callable
 from PIL import Image, ImageTk
 
 from api_client import ApiError, AuthError
+from label_cache import (
+    cached_count,
+    get_line_pdf,
+    job_labels_ready,
+    job_line_ids,
+    put_line_pdf,
+    save_zip,
+)
 from local_print import print_pdf, render_code128_image
 from packing_config import load_config, save_config
 
@@ -22,7 +30,9 @@ class FbsPackingMixin:
         self._fbs_barcode_photo: ImageTk.PhotoImage | None = None
         self._fbs_selected_group: dict | None = None
         self._fbs_last_scan_code = ""
-        self._fbs_last_scan_line_id: int | None = None
+        self._fbs_last_scan_sku = ""
+        self._fbs_last_scan_line_ids: list[int] = []
+        self._fbs_prefetching_job_id: int | None = None
         cfg = load_config()
         skip_raw = str(cfg.get("fbs_skip_mp_confirm") or "").strip().lower()
         self.fbs_skip_mp_var = tk.BooleanVar(value=skip_raw in {"1", "true", "yes", "on"})
@@ -34,6 +44,11 @@ class FbsPackingMixin:
         toolbar = ttk.Frame(tab)
         toolbar.pack(fill=tk.X, pady=(0, 8))
         ttk.Button(toolbar, text="Обновить", command=self.load_fbs_jobs).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="Скачать ярлыки", command=self.download_fbs_labels).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        self.fbs_cache_hint = ttk.Label(toolbar, text="", foreground="#555")
+        self.fbs_cache_hint.pack(side=tk.LEFT, padx=12)
         self.fbs_api_hint = ttk.Label(toolbar, text="", foreground="#a33")
         self.fbs_api_hint.pack(side=tk.LEFT, padx=12)
 
@@ -175,21 +190,145 @@ class FbsPackingMixin:
     def _fbs_skip_mp_enabled(self) -> bool:
         return bool(self.fbs_skip_mp_var.get())
 
+    def _fbs_update_cache_hint(self) -> None:
+        job = self.fbs_job or {}
+        jid = job.get("id")
+        ids = job_line_ids(job)
+        if not jid or not ids:
+            self.fbs_cache_hint.config(text="")
+            return
+        have, total = cached_count(int(jid), ids)
+        if have >= total:
+            self.fbs_cache_hint.config(text=f"Ярлыки: {have}/{total} на диске", foreground="#2a7")
+        elif have:
+            self.fbs_cache_hint.config(text=f"Ярлыки: {have}/{total} на диске", foreground="#a80")
+        else:
+            self.fbs_cache_hint.config(text="Ярлыки не скачаны", foreground="#a33")
+
+    def _fbs_resolve_line_pdfs(
+        self,
+        job_id: int,
+        line_ids: list[int],
+        payload_pdfs: list[str] | None = None,
+    ) -> list[bytes]:
+        pdfs: list[bytes] = []
+        for index, line_id in enumerate(line_ids):
+            cached = get_line_pdf(job_id, line_id)
+            if cached:
+                pdfs.append(cached)
+                continue
+            raw = ""
+            if payload_pdfs and index < len(payload_pdfs):
+                raw = str(payload_pdfs[index] or "")
+            if raw:
+                pdf = base64.b64decode(raw)
+                put_line_pdf(job_id, line_id, pdf)
+                pdfs.append(pdf)
+                continue
+            pdf = self.client.fbs_download_line_pdf(job_id, line_id)
+            put_line_pdf(job_id, line_id, pdf)
+            pdfs.append(pdf)
+        return pdfs
+
+    def _fbs_prefetch_labels(self, job: dict, *, interactive: bool) -> None:
+        job_id = int(job.get("id") or 0)
+        if not job_id:
+            return
+        if self._fbs_prefetching_job_id == job_id and not interactive:
+            return
+        if job_labels_ready(job) and not interactive:
+            self._fbs_update_cache_hint()
+            return
+        if interactive:
+            if self.fbs_busy:
+                return
+            self.fbs_busy = True
+            self.set_status("Скачивание ярлыков...")
+
+        self._fbs_prefetching_job_id = job_id
+
+        def worker():
+            zip_bytes = self.client.fbs_download_line_labels_zip(job_id)
+            return save_zip(job_id, zip_bytes)
+
+        def on_ok(saved: int) -> None:
+            if interactive:
+                self.fbs_busy = False
+            if self._fbs_prefetching_job_id == job_id:
+                self._fbs_prefetching_job_id = None
+            self._fbs_update_cache_hint()
+            self.set_status(f"Ярлыки сохранены локально: {saved}")
+            if interactive:
+                self._fbs_focus_scan()
+
+        def on_err(exc: Exception) -> None:
+            if interactive:
+                self.fbs_busy = False
+            if self._fbs_prefetching_job_id == job_id:
+                self._fbs_prefetching_job_id = None
+            if interactive:
+                if isinstance(exc, AuthError):
+                    messagebox.showerror("Сессия", str(exc))
+                    self.on_close()
+                    return
+                if isinstance(exc, ApiError):
+                    messagebox.showwarning("FBS", str(exc))
+                    self.set_status(str(exc))
+                    self._fbs_focus_scan()
+                    return
+                self._background_error(exc)
+                self._fbs_focus_scan()
+            else:
+                self.fbs_cache_hint.config(text="Не удалось скачать ярлыки", foreground="#a33")
+
+        self._run_task(worker, on_ok, on_err)
+
+    def download_fbs_labels(self) -> None:
+        job = self.fbs_job
+        if not job:
+            messagebox.showwarning("FBS", "Сначала откройте задание")
+            return
+        if not self._fbs_require_api():
+            return
+        self._fbs_prefetch_labels(job, interactive=True)
+
     def _fbs_reprint_last_line(self, job_id: int) -> None:
-        line_id = self._fbs_last_scan_line_id
-        if not line_id:
+        line_ids = list(self._fbs_last_scan_line_ids)
+        if not line_ids:
             messagebox.showwarning("FBS", "Нет последней строки для перепечатки")
             return
 
         def worker():
-            return self.client.fbs_download_line_pdf(job_id, int(line_id))
+            return self._fbs_resolve_line_pdfs(job_id, [int(line_id) for line_id in line_ids])
 
-        def on_ok(pdf: bytes) -> None:
-            print_pdf(pdf, **self._label_print_profile())
-            self.set_status("Ярлык перепечатан")
+        def on_ok(pdfs: list[bytes]) -> None:
+            for pdf in pdfs:
+                print_pdf(pdf, **self._label_print_profile())
+            self.set_status(f"Ярлык перепечатан ({len(pdfs)})")
             self._fbs_focus_scan()
 
         self._fbs_run(worker, on_ok, status="Перепечатка...")
+
+    def _fbs_sku_has_pending(self, sku: str) -> bool:
+        want = str(sku or "").strip().casefold()
+        if not want:
+            return False
+        job = self.fbs_job or {}
+        for line in job.get("lines") or []:
+            if str(line.get("sku") or "").strip().casefold() != want:
+                continue
+            if str(line.get("status") or "") == "pending":
+                return True
+        for group in job.get("remaining_groups") or []:
+            if str(group.get("sku") or "").strip().casefold() != want:
+                continue
+            try:
+                qty = int(group.get("quantity") or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            if qty > 0:
+                return True
+        return False
 
     def _fbs_auto_close_lines(self, job_id: int, lines: list[dict]) -> dict:
         payload: dict | None = None
@@ -274,6 +413,7 @@ class FbsPackingMixin:
             self._fbs_render_job()
             self.set_status(f"FBS задание #{job.get('id')}")
             self._fbs_focus_scan()
+            self._fbs_prefetch_labels(job, interactive=False)
 
         self.set_status("Открытие FBS...")
         self._run_task(worker, on_ok)
@@ -287,6 +427,7 @@ class FbsPackingMixin:
         pending = job.get("line_pending", job.get("remaining", 0))
         printed = job.get("line_printed", 0)
         self.fbs_job_stats.config(text=f"готово {done}/{total} · осталось {pending} · в печати {printed}")
+        self._fbs_update_cache_hint()
         if job.get("require_cis"):
             self.fbs_cis_hint.config(
                 text="Обязательная маркировка ЧЗ: для товаров с GTIN пикайте КИЗ (Data Matrix), не обычный ШК."
@@ -407,10 +548,17 @@ class FbsPackingMixin:
         sku = str(group.get("sku") or "")
         raw_pid = group.get("product_id")
         product_id = int(raw_pid) if raw_pid not in (None, "") else None
+        include_pdf = not job_labels_ready(job)
         batch = bool(self.fbs_batch_var.get())
 
         def worker():
-            return self.client.fbs_pick_sku(job_id, sku=sku, product_id=product_id, batch=batch)
+            return self.client.fbs_pick_sku(
+                job_id,
+                sku=sku,
+                product_id=product_id,
+                batch=batch,
+                include_pdf=include_pdf,
+            )
 
         scan_key = sku.casefold() if sku else str(product_id or "")
         self._fbs_handle_allocate(worker, status="Выделение SKU...", scan_code=scan_key)
@@ -449,16 +597,19 @@ class FbsPackingMixin:
             self._fbs_skip_mp_enabled()
             and scan_key
             and scan_key == self._fbs_last_scan_code
-            and self._fbs_last_scan_line_id
+            and self._fbs_last_scan_line_ids
+            and not self._fbs_sku_has_pending(self._fbs_last_scan_sku)
         ):
             if messagebox.askyesno("FBS", "Распечатать заново?"):
                 self._fbs_reprint_last_line(job_id)
-                return
+            self._fbs_focus_scan()
+            return
 
-        batch = bool(self.fbs_batch_var.get()) and not self._fbs_skip_mp_enabled()
+        batch = bool(self.fbs_batch_var.get())
+        include_pdf = not job_labels_ready(job)
 
         def worker_product():
-            return self.client.fbs_scan_product(job_id, code, batch=batch)
+            return self.client.fbs_scan_product(job_id, code, batch=batch, include_pdf=include_pdf)
 
         self._fbs_handle_allocate(worker_product, status="Пик товара...", scan_code=scan_key)
 
@@ -473,23 +624,31 @@ class FbsPackingMixin:
         job_id = int(job["id"]) if job.get("id") else 0
         skip_mp = self._fbs_skip_mp_enabled()
 
-        def on_ok(payload: dict) -> None:
+        def wrapped_worker() -> tuple[dict, list[dict], list[bytes]]:
+            payload = worker()
             lines = payload.get("lines") or ([payload.get("line")] if payload.get("line") else [])
+            payload_pdfs = list(payload.get("pdfs_base64") or [])
+            if not payload_pdfs and payload.get("pdf_base64"):
+                payload_pdfs = [payload.get("pdf_base64")]
+            line_ids = [int(item["id"]) for item in lines if item and item.get("id")]
+            pdfs = self._fbs_resolve_line_pdfs(job_id, line_ids, payload_pdfs) if job_id else []
             if skip_mp and job_id and lines:
-                try:
-                    payload = self._fbs_auto_close_lines(job_id, lines)
-                except Exception as exc:
-                    messagebox.showerror("FBS", f"Не удалось закрыть строку: {exc}")
+                payload = self._fbs_auto_close_lines(job_id, lines) or payload
+            return payload, lines, pdfs
+
+        def on_ok(result: tuple[dict, list[dict], list[bytes]]) -> None:
+            payload, lines, pdfs = result
+            allocate_line = lines[0] if lines else {}
             self.fbs_job = payload.get("job") or self.fbs_job
-            pdfs = payload.get("pdfs_base64") or []
-            if not pdfs and payload.get("pdf_base64"):
-                pdfs = [payload.get("pdf_base64")]
-            lines = payload.get("lines") or ([payload.get("line")] if payload.get("line") else [])
+            closed_lines = payload.get("lines") or (
+                [payload.get("line")] if payload.get("line") else []
+            )
+            line = (closed_lines[0] if closed_lines else None) or allocate_line or {}
             self._fbs_render_job()
             printed = 0
             try:
-                for pdf_b64 in pdfs:
-                    print_pdf(base64.b64decode(pdf_b64), **self._label_print_profile())
+                for pdf in pdfs:
+                    print_pdf(pdf, **self._label_print_profile())
                     printed += 1
             except Exception as exc:
                 messagebox.showerror("Печать", str(exc))
@@ -498,14 +657,23 @@ class FbsPackingMixin:
                 )
                 self._fbs_focus_scan()
                 return
-            sku = (lines[0] or {}).get("sku") if lines else ""
-            line = lines[0] if lines else {}
+            sku = line.get("sku") if line else ""
             cis_note = " · КИЗ записан" if line and line.get("has_cis") else ""
-            if skip_mp and line and line.get("id"):
-                self._fbs_last_scan_code = scan_code or self._fbs_scan_key(str(line.get("sku") or ""))
-                self._fbs_last_scan_line_id = int(line["id"])
+            if skip_mp:
+                printed_ids = [
+                    int(item["id"])
+                    for item in (lines or [])
+                    if item and item.get("id")
+                ]
+                if printed_ids:
+                    self._fbs_last_scan_code = scan_code or self._fbs_scan_key(str(sku or ""))
+                    self._fbs_last_scan_sku = str(sku or "")
+                    self._fbs_last_scan_line_ids = printed_ids
             if printed > 1:
-                self.set_status(f"Напечатано ярлыков: {printed} · SKU {sku} · пропикайте ярлыки подряд")
+                if skip_mp:
+                    self.set_status(f"Готово · SKU {sku} · ярлыков {printed} · пикайте следующий")
+                else:
+                    self.set_status(f"Напечатано ярлыков: {printed} · SKU {sku} · пропикайте ярлыки подряд")
             elif printed == 1:
                 if skip_mp:
                     self.set_status(
@@ -519,7 +687,7 @@ class FbsPackingMixin:
                 self.set_status("Строка выделена")
             self._fbs_focus_scan()
 
-        self._fbs_run(worker, on_ok, status=status)
+        self._fbs_run(wrapped_worker, on_ok, status=status)
 
     def _fbs_active_lines(self) -> list[dict]:
         job = self.fbs_job or {}
@@ -543,7 +711,7 @@ class FbsPackingMixin:
         line_ids = [int(item["id"]) for item in actives]
 
         def worker():
-            return [self.client.fbs_download_line_pdf(job_id, line_id) for line_id in line_ids]
+            return self._fbs_resolve_line_pdfs(job_id, line_ids)
 
         def on_ok(pdfs: list[bytes]) -> None:
             for pdf in pdfs:

@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import base64
 import io
-import os
 import tkinter as tk
-from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Callable
 
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageTk
 
 from api_client import ApiError, AuthError
 from image_cache import begin_fetch, fetch_url, get_cached_bytes
@@ -39,8 +37,6 @@ _FBS_BARCODE_W = 180
 _FBS_BARCODE_H = 80
 _FBS_ACTIVE_IMG = 110
 _FBS_LIST_IMG = 32
-_FBS_SEQ_COL_W = 40
-_FBS_LINE_TREE0_W = _FBS_SEQ_COL_W + 6 + _FBS_LIST_IMG
 
 
 def _fbs_job_status_ru(value: object) -> str:
@@ -126,6 +122,179 @@ class _TreeHoverTip:
         self._tip = tip
 
 
+class _FbsLinesTable(ttk.Frame):
+    """Строки FBS: отдельные колонки №, фото, артикул, заказ, статус."""
+
+    _MIN = (40, 40, 110, 140, 90)
+
+    def __init__(self, master, *, on_context) -> None:
+        super().__init__(master)
+        self._on_context = on_context
+        self._rows: dict[str, dict[str, Any]] = {}
+        self._selected = ""
+        self._order: list[str] = []
+
+        header = ttk.Frame(self)
+        header.pack(fill=tk.X)
+        for i, title in enumerate(("№", "Фото", "Артикул", "Заказ", "Статус")):
+            header.grid_columnconfigure(i, minsize=self._MIN[i], weight=1 if i == 3 else 0)
+            ttk.Label(header, text=title, anchor="w").grid(row=0, column=i, sticky="ew", padx=4, pady=2)
+
+        body = ttk.Frame(self)
+        body.pack(fill=tk.BOTH, expand=True)
+        self._canvas = tk.Canvas(body, highlightthickness=0, background="#fff")
+        scroll = ttk.Scrollbar(body, orient=tk.VERTICAL, command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._inner = ttk.Frame(self._canvas)
+        self._win = self._canvas.create_window((0, 0), window=self._inner, anchor="nw")
+        for i, width in enumerate(self._MIN):
+            self._inner.grid_columnconfigure(i, minsize=width, weight=1 if i == 3 else 0)
+        self._inner.bind("<Configure>", self._on_inner_configure)
+        self._canvas.bind("<Configure>", self._on_canvas_configure)
+        self._canvas.bind("<MouseWheel>", self._on_wheel)
+
+    def _on_inner_configure(self, _event=None) -> None:
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event) -> None:
+        self._canvas.itemconfigure(self._win, width=event.width)
+
+    def _on_wheel(self, event) -> None:
+        self._canvas.yview_scroll(int(-event.delta / 120), "units")
+        return "break"
+
+    def clear(self) -> None:
+        for child in self._inner.winfo_children():
+            child.destroy()
+        self._rows = {}
+        self._order = []
+        self._selected = ""
+
+    def exists(self, iid: str) -> bool:
+        return str(iid) in self._rows
+
+    def add_row(
+        self,
+        iid: str,
+        *,
+        seq: object,
+        sku: str,
+        order: str,
+        status: str,
+        photo: ImageTk.PhotoImage | None,
+        tip: str,
+    ) -> None:
+        iid = str(iid)
+        row = len(self._order)
+        bg = "#ffffff" if row % 2 == 0 else "#f4f4f4"
+        widgets: list[tk.Widget] = []
+        seq_l = tk.Label(self._inner, text=str(seq or ""), anchor="center", background=bg)
+        seq_l.grid(row=row, column=0, sticky="nsew", padx=4, pady=3)
+        widgets.append(seq_l)
+        img_hold = tk.Frame(self._inner, width=36, height=36, background=bg)
+        img_hold.grid(row=row, column=1, sticky="nsew", padx=4, pady=3)
+        img_hold.grid_propagate(False)
+        img_l = tk.Label(img_hold, background=bg)
+        img_l.place(relx=0.5, rely=0.5, anchor="center")
+        if photo is not None:
+            img_l.config(image=photo)
+        widgets.append(img_hold)
+        widgets.append(img_l)
+        sku_l = tk.Label(self._inner, text=sku, anchor="w", background=bg)
+        sku_l.grid(row=row, column=2, sticky="nsew", padx=4, pady=3)
+        widgets.append(sku_l)
+        order_l = tk.Label(self._inner, text=order, anchor="w", background=bg)
+        order_l.grid(row=row, column=3, sticky="nsew", padx=4, pady=3)
+        widgets.append(order_l)
+        status_l = tk.Label(self._inner, text=status, anchor="w", background=bg)
+        status_l.grid(row=row, column=4, sticky="nsew", padx=4, pady=3)
+        widgets.append(status_l)
+        for widget in widgets:
+            widget.bind("<Button-1>", lambda _e, key=iid: self.select(key))
+            widget.bind("<Button-3>", lambda e, key=iid: self._context(e, key))
+            widget.bind("<MouseWheel>", self._on_wheel)
+        if tip:
+            for widget in (sku_l, order_l, seq_l):
+                self._bind_tip(widget, tip)
+        self._rows[iid] = {
+            "bg": bg,
+            "widgets": widgets,
+            "photo": img_l,
+        }
+        self._order.append(iid)
+
+    def _bind_tip(self, widget: tk.Widget, text: str) -> None:
+        state = {"after": None, "tip": None}
+
+        def hide(_event=None) -> None:
+            if state["after"]:
+                try:
+                    widget.after_cancel(state["after"])
+                except Exception:
+                    pass
+                state["after"] = None
+            if state["tip"] is not None:
+                try:
+                    state["tip"].destroy()
+                except Exception:
+                    pass
+                state["tip"] = None
+
+        def show() -> None:
+            state["after"] = None
+            if state["tip"] is not None:
+                return
+            tip = tk.Toplevel(widget)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{widget.winfo_pointerx() + 12}+{widget.winfo_pointery() + 16}")
+            tk.Label(
+                tip,
+                text=text,
+                justify=tk.LEFT,
+                background="#ffffe0",
+                relief=tk.SOLID,
+                borderwidth=1,
+                padx=6,
+                pady=4,
+                wraplength=420,
+            ).pack()
+            state["tip"] = tip
+
+        def schedule(_event=None) -> None:
+            hide()
+            state["after"] = widget.after(400, show)
+
+        widget.bind("<Enter>", schedule, add="+")
+        widget.bind("<Leave>", hide, add="+")
+
+    def select(self, iid: str) -> None:
+        iid = str(iid)
+        self._selected = iid
+        for key, row in self._rows.items():
+            color = "#cde8ff" if key == iid else row["bg"]
+            for widget in row["widgets"]:
+                try:
+                    widget.configure(background=color)
+                except tk.TclError:
+                    pass
+
+    def _context(self, event, iid: str) -> None:
+        self.select(iid)
+        self._on_context(event, iid)
+
+    def set_photo(self, iid: str, photo: ImageTk.PhotoImage | None) -> None:
+        row = self._rows.get(str(iid))
+        if not row:
+            return
+        label: tk.Label = row["photo"]
+        if photo is None:
+            label.config(image="", text="")
+        else:
+            label.config(image=photo, text="")
+
+
 class FbsPackingMixin:
     """Вкладка «Упаковка FBS» для PackingApp."""
 
@@ -137,7 +306,6 @@ class FbsPackingMixin:
         self._fbs_active_photo: ImageTk.PhotoImage | None = None
         self._fbs_photo_cache: dict[str, ImageTk.PhotoImage] = {}
         self._fbs_line_urls: dict[str, str] = {}
-        self._fbs_line_seqs: dict[str, str] = {}
         self._fbs_remaining_urls: dict[str, str] = {}
         self._fbs_selected_group: dict | None = None
         self._fbs_last_scan_code = ""
@@ -279,12 +447,12 @@ class FbsPackingMixin:
             height=10,
             style="FbsThumb.Treeview",
         )
-        self.fbs_remaining_tree.heading("#0", text="")
+        self.fbs_remaining_tree.heading("#0", text="Фото")
         self.fbs_remaining_tree.heading("sku", text="Артикул")
         self.fbs_remaining_tree.heading("name", text="Название")
         self.fbs_remaining_tree.heading("qty", text="Ост.")
         self.fbs_remaining_tree.heading("barcode", text="ШК")
-        self.fbs_remaining_tree.column("#0", width=40, stretch=False, minwidth=36)
+        self.fbs_remaining_tree.column("#0", width=44, stretch=False, minwidth=44)
         self.fbs_remaining_tree.column("sku", width=90, stretch=False)
         self.fbs_remaining_tree.column("name", width=180)
         self.fbs_remaining_tree.column("qty", width=46, stretch=False)
@@ -313,24 +481,11 @@ class FbsPackingMixin:
 
         self.fbs_lines_frame = ttk.LabelFrame(right, text="Строки задания", padding=6)
         self.fbs_lines_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        self.fbs_lines_tree = ttk.Treeview(
+        self.fbs_lines_table = _FbsLinesTable(
             self.fbs_lines_frame,
-            columns=("sku", "order", "status"),
-            show="tree headings",
-            height=8,
-            style="FbsThumb.Treeview",
+            on_context=self._fbs_lines_context_menu,
         )
-        self.fbs_lines_tree.heading("#0", text="№")
-        self.fbs_lines_tree.heading("sku", text="Артикул")
-        self.fbs_lines_tree.heading("order", text="Заказ")
-        self.fbs_lines_tree.heading("status", text="Статус")
-        self.fbs_lines_tree.column("#0", width=_FBS_LINE_TREE0_W, stretch=False, minwidth=_FBS_LINE_TREE0_W)
-        self.fbs_lines_tree.column("sku", width=110, stretch=False)
-        self.fbs_lines_tree.column("order", width=140)
-        self.fbs_lines_tree.column("status", width=90, stretch=False)
-        self.fbs_lines_tree.pack(fill=tk.BOTH, expand=True)
-        self.fbs_lines_tree.bind("<Button-3>", self._fbs_lines_context_menu)
-        _TreeHoverTip(self.fbs_lines_tree, self._fbs_lines_tip)
+        self.fbs_lines_table.pack(fill=tk.BOTH, expand=True)
 
     def _fbs_save_skip_mp_setting(self) -> None:
         cfg = load_config()
@@ -360,40 +515,6 @@ class FbsPackingMixin:
         if idx >= len(values):
             return ""
         return str(values[idx] or "")
-
-    def _fbs_lines_tip(self, row: str, col: str) -> str:
-        values = self.fbs_lines_tree.item(row, "values") or ()
-        job = self.fbs_job or {}
-        line = next((item for item in (job.get("lines") or []) if str(item.get("id")) == str(row)), None)
-        name = str((line or {}).get("product_name") or "")
-        seq = str((line or {}).get("seq") or "")
-        if col == "#0":
-            return " ".join(part for part in (seq, name) if part)
-        mapping = {"#1": 0, "#2": 1, "#3": 2}
-        idx = mapping.get(col)
-        if idx is None:
-            parts = [seq] + [str(v) for v in values if v]
-            if name:
-                parts.append(name)
-            return " · ".join(parts)
-        if idx >= len(values):
-            return name
-        text = str(values[idx] or "")
-        if idx == 0 and name:
-            return f"{text}\n{name}" if text else name
-        return text
-
-    def _fbs_ui_font(self, size: int = 12) -> ImageFont.ImageFont:
-        windir = os.environ.get("WINDIR") or r"C:\Windows"
-        for name in ("segoeui.ttf", "tahoma.ttf", "arial.ttf"):
-            path = Path(windir) / "Fonts" / name
-            if not path.is_file():
-                continue
-            try:
-                return ImageFont.truetype(str(path), size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
 
     def _fbs_thumb_pil(self, url: str, size: int) -> Image.Image | None:
         raw = str(url or "").strip()
@@ -425,40 +546,6 @@ class FbsPackingMixin:
         self._fbs_photo_cache[key] = photo
         return photo
 
-    def _fbs_line_row_photo(self, seq: object, url: str) -> ImageTk.PhotoImage:
-        label = str(seq or "").strip()
-        raw = str(url or "").strip()
-        key = f"row:{label}:{raw}:{_FBS_LIST_IMG}"
-        cached = self._fbs_photo_cache.get(key)
-        if cached is not None:
-            return cached
-        height = max(36, _FBS_LIST_IMG)
-        canvas = Image.new("RGB", (_FBS_LINE_TREE0_W, height), (255, 255, 255))
-        draw = ImageDraw.Draw(canvas)
-        font = self._fbs_ui_font(12)
-        bbox = draw.textbbox((0, 0), label or "·", font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(
-            ((_FBS_SEQ_COL_W - tw) / 2 - bbox[0], (height - th) / 2 - bbox[1]),
-            label or "·",
-            fill=(30, 30, 30),
-            font=font,
-        )
-        thumb = self._fbs_thumb_pil(raw, _FBS_LIST_IMG)
-        x = _FBS_SEQ_COL_W + 4
-        y = (height - _FBS_LIST_IMG) // 2
-        if thumb is None:
-            draw.rectangle(
-                (x, y, x + _FBS_LIST_IMG - 1, y + _FBS_LIST_IMG - 1),
-                outline=(200, 200, 200),
-                fill=(243, 243, 243),
-            )
-        else:
-            canvas.paste(thumb, (x, y + (_FBS_LIST_IMG - thumb.size[1]) // 2))
-        photo = ImageTk.PhotoImage(canvas)
-        self._fbs_photo_cache[key] = photo
-        return photo
-
     def _fbs_ensure_image(self, url: str) -> None:
         raw = str(url or "").strip()
         if not begin_fetch(raw):
@@ -476,10 +563,9 @@ class FbsPackingMixin:
 
     def _fbs_apply_loaded_images(self) -> None:
         for iid, url in list(self._fbs_line_urls.items()):
-            if not self.fbs_lines_tree.exists(iid):
+            if not self.fbs_lines_table.exists(iid):
                 continue
-            seq = self._fbs_line_seqs.get(iid, "")
-            self.fbs_lines_tree.item(iid, image=self._fbs_line_row_photo(seq, url))
+            self.fbs_lines_table.set_photo(iid, self._fbs_thumb_photo(url, _FBS_LIST_IMG))
         for iid, url in list(self._fbs_remaining_urls.items()):
             if not self.fbs_remaining_tree.exists(iid):
                 continue
@@ -523,14 +609,12 @@ class FbsPackingMixin:
                 continue
         return None
 
-    def _fbs_lines_context_menu(self, event) -> None:
-        iid = self.fbs_lines_tree.identify_row(event.y)
-        if not iid:
-            return
-        self.fbs_lines_tree.selection_set(iid)
+    def _fbs_lines_context_menu(self, event, iid: str) -> None:
         job = self.fbs_job or {}
         line = next((item for item in (job.get("lines") or []) if str(item.get("id")) == str(iid)), None)
-        status = str((line or {}).get("status") or "")
+        if line is None:
+            return
+        status = str(line.get("status") or "")
         menu = tk.Menu(self, tearoff=0)
         if status in {"printed", "done"}:
             menu.add_command(
@@ -856,25 +940,24 @@ class FbsPackingMixin:
                 self.fbs_active_var.set(f"Нет активной строки — {hint}")
                 self._fbs_set_active_image("")
 
-        self.fbs_lines_tree.delete(*self.fbs_lines_tree.get_children())
+        self.fbs_lines_table.clear()
         self._fbs_line_urls = {}
-        self._fbs_line_seqs = {}
         for line in job.get("lines") or []:
             iid = str(line.get("id"))
             url = str(line.get("image_url") or "")
-            seq = line.get("seq", "")
             self._fbs_line_urls[iid] = url
-            self._fbs_line_seqs[iid] = str(seq or "")
-            self.fbs_lines_tree.insert(
-                "",
-                tk.END,
-                iid=iid,
-                image=self._fbs_line_row_photo(seq, url),
-                values=(
-                    line.get("sku", ""),
-                    line.get("order_display") or line.get("order_id") or "",
-                    _fbs_line_status_ru(line.get("status")),
-                ),
+            sku = str(line.get("sku") or "")
+            name = str(line.get("product_name") or "")
+            order = str(line.get("order_display") or line.get("order_id") or "")
+            tip = " · ".join(part for part in (sku, name, order) if part)
+            self.fbs_lines_table.add_row(
+                iid,
+                seq=line.get("seq", ""),
+                sku=sku,
+                order=order,
+                status=_fbs_line_status_ru(line.get("status")),
+                photo=self._fbs_thumb_photo(url, _FBS_LIST_IMG) if url else None,
+                tip=tip,
             )
         if self.fbs_manual_var.get():
             self._fbs_render_remaining()

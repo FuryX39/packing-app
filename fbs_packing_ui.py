@@ -550,6 +550,7 @@ class FbsPackingMixin:
         product_id = int(raw_pid) if raw_pid not in (None, "") else None
         include_pdf = not job_labels_ready(job)
         batch = bool(self.fbs_batch_var.get())
+        auto_close = self._fbs_skip_mp_enabled()
 
         def worker():
             return self.client.fbs_pick_sku(
@@ -558,6 +559,7 @@ class FbsPackingMixin:
                 product_id=product_id,
                 batch=batch,
                 include_pdf=include_pdf,
+                auto_close=auto_close,
             )
 
         scan_key = sku.casefold() if sku else str(product_id or "")
@@ -607,9 +609,16 @@ class FbsPackingMixin:
 
         batch = bool(self.fbs_batch_var.get())
         include_pdf = not job_labels_ready(job)
+        auto_close = self._fbs_skip_mp_enabled()
 
         def worker_product():
-            return self.client.fbs_scan_product(job_id, code, batch=batch, include_pdf=include_pdf)
+            return self.client.fbs_scan_product(
+                job_id,
+                code,
+                batch=batch,
+                include_pdf=include_pdf,
+                auto_close=auto_close,
+            )
 
         self._fbs_handle_allocate(worker_product, status="Пик товара...", scan_code=scan_key)
 
@@ -623,8 +632,9 @@ class FbsPackingMixin:
         job = self.fbs_job or {}
         job_id = int(job["id"]) if job.get("id") else 0
         skip_mp = self._fbs_skip_mp_enabled()
+        print_profile = self._label_print_profile()
 
-        def wrapped_worker() -> tuple[dict, list[dict], list[bytes]]:
+        def wrapped_worker() -> tuple[dict, list[dict], int, Exception | None, Exception | None]:
             payload = worker()
             lines = payload.get("lines") or ([payload.get("line")] if payload.get("line") else [])
             payload_pdfs = list(payload.get("pdfs_base64") or [])
@@ -632,12 +642,31 @@ class FbsPackingMixin:
                 payload_pdfs = [payload.get("pdf_base64")]
             line_ids = [int(item["id"]) for item in lines if item and item.get("id")]
             pdfs = self._fbs_resolve_line_pdfs(job_id, line_ids, payload_pdfs) if job_id else []
-            if skip_mp and job_id and lines:
-                payload = self._fbs_auto_close_lines(job_id, lines) or payload
-            return payload, lines, pdfs
+            printed = 0
+            print_error: Exception | None = None
+            close_error: Exception | None = None
+            try:
+                for pdf in pdfs:
+                    print_pdf(pdf, **print_profile)
+                    printed += 1
+            except Exception as exc:
+                print_error = exc
+            need_close = [
+                item
+                for item in lines
+                if item and item.get("id") and str(item.get("status") or "") != "done"
+            ]
+            if skip_mp and job_id and need_close:
+                try:
+                    payload = self._fbs_auto_close_lines(job_id, need_close) or payload
+                except Exception as exc:
+                    close_error = exc
+            return payload, lines, printed, print_error, close_error
 
-        def on_ok(result: tuple[dict, list[dict], list[bytes]]) -> None:
-            payload, lines, pdfs = result
+        def on_ok(
+            result: tuple[dict, list[dict], int, Exception | None, Exception | None],
+        ) -> None:
+            payload, lines, printed, print_error, close_error = result
             allocate_line = lines[0] if lines else {}
             self.fbs_job = payload.get("job") or self.fbs_job
             closed_lines = payload.get("lines") or (
@@ -645,18 +674,15 @@ class FbsPackingMixin:
             )
             line = (closed_lines[0] if closed_lines else None) or allocate_line or {}
             self._fbs_render_job()
-            printed = 0
-            try:
-                for pdf in pdfs:
-                    print_pdf(pdf, **self._label_print_profile())
-                    printed += 1
-            except Exception as exc:
-                messagebox.showerror("Печать", str(exc))
+            if print_error is not None:
+                messagebox.showerror("Печать", str(print_error))
                 self.set_status(
-                    f"Получено ярлыков: {len(pdfs)}, напечатано: {printed}. Можно Перепечатать"
+                    f"Получено ярлыков: {printed}. Можно Перепечатать"
                 )
                 self._fbs_focus_scan()
                 return
+            if close_error is not None:
+                messagebox.showwarning("FBS", f"Ярлык напечатан, но строка не закрыта: {close_error}")
             sku = line.get("sku") if line else ""
             cis_note = " · КИЗ записан" if line and line.get("has_cis") else ""
             if skip_mp:

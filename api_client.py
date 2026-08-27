@@ -259,11 +259,17 @@ class WarehouseApiClient:
         *,
         batch: bool = False,
         include_pdf: bool = True,
+        auto_close: bool = False,
     ) -> dict[str, Any]:
         resp = self._api_request(
             "POST",
             f"/api/v1/fbs-packing/jobs/{int(job_id)}/scan-product",
-            json={"barcode": barcode, "batch": bool(batch), "include_pdf": bool(include_pdf)},
+            json={
+                "barcode": barcode,
+                "batch": bool(batch),
+                "include_pdf": bool(include_pdf),
+                "auto_close": bool(auto_close),
+            },
             timeout=60,
         )
         return resp.json()
@@ -276,8 +282,14 @@ class WarehouseApiClient:
         product_id: int | None = None,
         batch: bool = False,
         include_pdf: bool = True,
+        auto_close: bool = False,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"sku": sku, "batch": bool(batch), "include_pdf": bool(include_pdf)}
+        body: dict[str, Any] = {
+            "sku": sku,
+            "batch": bool(batch),
+            "include_pdf": bool(include_pdf),
+            "auto_close": bool(auto_close),
+        }
         if product_id is not None:
             body["product_id"] = int(product_id)
         resp = self._api_request(

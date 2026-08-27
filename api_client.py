@@ -325,6 +325,15 @@ class WarehouseApiClient:
         )
         return resp.json()
 
+    def fbs_set_line_status(self, job_id: int, line_id: int, status: str) -> dict[str, Any]:
+        resp = self._api_request(
+            "POST",
+            f"/api/v1/fbs-packing/jobs/{int(job_id)}/lines/{int(line_id)}/set-status",
+            json={"status": str(status or "").strip()},
+            timeout=30,
+        )
+        return resp.json()
+
     def fbs_download_line_pdf(self, job_id: int, line_id: int) -> bytes:
         resp = self._api_request(
             "GET",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Any, Callable
@@ -8,6 +9,7 @@ from typing import Any, Callable
 from PIL import Image, ImageTk
 
 from api_client import ApiError, AuthError
+from image_cache import begin_fetch, fetch_url, get_cached_bytes
 from label_cache import (
     cached_count,
     get_line_pdf,
@@ -19,6 +21,106 @@ from label_cache import (
 from local_print import print_pdf, render_code128_image
 from packing_config import load_config, save_config
 
+_FBS_JOB_STATUS_RU = {
+    "open": "Открыто",
+    "in_progress": "В работе",
+    "done": "Готово",
+    "cancelled": "Отменено",
+}
+_FBS_LINE_STATUS_RU = {
+    "pending": "В сборке",
+    "printed": "Печать",
+    "done": "Готово",
+}
+_FBS_JOBS_SASH_PX = 160
+_FBS_BARCODE_W = 180
+_FBS_BARCODE_H = 80
+_FBS_ACTIVE_IMG = 110
+_FBS_LIST_IMG = 32
+
+
+def _fbs_job_status_ru(value: object) -> str:
+    raw = str(value or "").strip()
+    return _FBS_JOB_STATUS_RU.get(raw, raw or "—")
+
+
+def _fbs_line_status_ru(value: object) -> str:
+    raw = str(value or "").strip()
+    return _FBS_LINE_STATUS_RU.get(raw, raw or "—")
+
+
+class _TreeHoverTip:
+    """Подсказка с полным текстом ячейки при удержании курсора."""
+
+    def __init__(self, tree: ttk.Treeview, text_fn: Callable[[str, str], str]) -> None:
+        self.tree = tree
+        self.text_fn = text_fn
+        self._after: str | None = None
+        self._tip: tk.Toplevel | None = None
+        self._last = ""
+        tree.bind("<Motion>", self._on_motion, add="+")
+        tree.bind("<Leave>", self._on_leave, add="+")
+        tree.bind("<Button>", self._on_leave, add="+")
+        tree.bind("<MouseWheel>", self._on_leave, add="+")
+
+    def _on_leave(self, _event=None) -> None:
+        self._cancel()
+        self._hide()
+        self._last = ""
+
+    def _on_motion(self, event) -> None:
+        row = self.tree.identify_row(event.y)
+        col = self.tree.identify_column(event.x)
+        key = f"{row}:{col}"
+        if key != self._last:
+            self._hide()
+            self._last = key
+        self._cancel()
+        if not row:
+            return
+        self._after = self.tree.after(
+            400, lambda r=row, c=col, x=event.x_root, y=event.y_root: self._show(r, c, x, y)
+        )
+
+    def _cancel(self) -> None:
+        if self._after:
+            try:
+                self.tree.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _hide(self) -> None:
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+    def _show(self, row: str, col: str, x: int, y: int) -> None:
+        self._after = None
+        text = (self.text_fn(row, col) or "").strip()
+        if not text:
+            return
+        self._hide()
+        tip = tk.Toplevel(self.tree)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x + 12}+{y + 16}")
+        label = tk.Label(
+            tip,
+            text=text,
+            justify=tk.LEFT,
+            background="#ffffe0",
+            relief=tk.SOLID,
+            borderwidth=1,
+            padx=6,
+            pady=4,
+            wraplength=420,
+        )
+        label.pack()
+        self._tip = tip
+
 
 class FbsPackingMixin:
     """Вкладка «Упаковка FBS» для PackingApp."""
@@ -28,6 +130,10 @@ class FbsPackingMixin:
         self.fbs_job: dict | None = None
         self.fbs_busy = False
         self._fbs_barcode_photo: ImageTk.PhotoImage | None = None
+        self._fbs_active_photo: ImageTk.PhotoImage | None = None
+        self._fbs_photo_cache: dict[str, ImageTk.PhotoImage] = {}
+        self._fbs_line_urls: dict[str, str] = {}
+        self._fbs_remaining_urls: dict[str, str] = {}
         self._fbs_selected_group: dict | None = None
         self._fbs_last_scan_code = ""
         self._fbs_last_scan_sku = ""
@@ -40,6 +146,8 @@ class FbsPackingMixin:
     def _build_fbs_tab(self) -> None:
         tab = ttk.Frame(self.notebook, padding=6)
         self.notebook.add(tab, text="Упаковка FBS")
+        style = ttk.Style(self)
+        style.configure("FbsThumb.Treeview", rowheight=36)
 
         toolbar = ttk.Frame(tab)
         toolbar.pack(fill=tk.X, pady=(0, 8))
@@ -54,11 +162,13 @@ class FbsPackingMixin:
 
         panes = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
         panes.pack(fill=tk.BOTH, expand=True)
+        self.fbs_panes = panes
 
         left = ttk.Frame(panes)
         right = ttk.Frame(panes)
         panes.add(left, weight=1)
-        panes.add(right, weight=3)
+        panes.add(right, weight=8)
+        self.after(80, self._fbs_shrink_jobs_pane)
 
         ttk.Label(left, text="Мои задания FBS").pack(anchor=tk.W)
         self.fbs_jobs_tree = ttk.Treeview(
@@ -70,11 +180,12 @@ class FbsPackingMixin:
         self.fbs_jobs_tree.heading("id", text="№")
         self.fbs_jobs_tree.heading("status", text="Статус")
         self.fbs_jobs_tree.heading("progress", text="Готово")
-        self.fbs_jobs_tree.column("id", width=50, stretch=False)
-        self.fbs_jobs_tree.column("status", width=90, stretch=False)
-        self.fbs_jobs_tree.column("progress", width=90, stretch=False)
+        self.fbs_jobs_tree.column("id", width=36, stretch=False, minwidth=32)
+        self.fbs_jobs_tree.column("status", width=72, stretch=False, minwidth=60)
+        self.fbs_jobs_tree.column("progress", width=52, stretch=False, minwidth=44)
         self.fbs_jobs_tree.pack(fill=tk.BOTH, expand=True)
         self.fbs_jobs_tree.bind("<<TreeviewSelect>>", self.on_fbs_job_select)
+        _TreeHoverTip(self.fbs_jobs_tree, self._fbs_jobs_tip)
 
         header = ttk.Frame(right)
         header.pack(fill=tk.X)
@@ -85,9 +196,25 @@ class FbsPackingMixin:
 
         active = ttk.LabelFrame(right, text="Активная строка (наклеить ярлык заказа)", padding=8)
         active.pack(fill=tk.X, pady=(8, 8))
+        active_inner = ttk.Frame(active)
+        active_inner.pack(fill=tk.X)
+        self.fbs_active_image_frame = tk.Frame(
+            active_inner,
+            width=_FBS_ACTIVE_IMG,
+            height=_FBS_ACTIVE_IMG,
+            background="#f3f3f3",
+            highlightthickness=1,
+            highlightbackground="#ccc",
+        )
+        self.fbs_active_image_frame.pack(side=tk.LEFT, padx=(0, 10))
+        self.fbs_active_image_frame.pack_propagate(False)
+        self.fbs_active_image = tk.Label(self.fbs_active_image_frame, background="#f3f3f3")
+        self.fbs_active_image.pack(fill=tk.BOTH, expand=True)
+        active_text = ttk.Frame(active_inner)
+        active_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.fbs_active_var = tk.StringVar(value="Нет активной строки — пикните товар")
-        ttk.Label(active, textvariable=self.fbs_active_var, wraplength=520).pack(anchor=tk.W)
-        active_btns = ttk.Frame(active)
+        ttk.Label(active_text, textvariable=self.fbs_active_var, wraplength=420).pack(anchor=tk.W)
+        active_btns = ttk.Frame(active_text)
         active_btns.pack(fill=tk.X, pady=(8, 0))
         ttk.Button(active_btns, text="Перепечатать ярлык", command=self.fbs_reprint_active).pack(side=tk.LEFT)
         ttk.Button(active_btns, text="Отменить печать", command=self.fbs_cancel_active).pack(
@@ -135,30 +262,44 @@ class FbsPackingMixin:
         remaining_wrap.pack(fill=tk.BOTH, expand=True)
         left_rem = ttk.Frame(remaining_wrap)
         left_rem.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ttk.Label(left_rem, text="Остаток (pending)").pack(anchor=tk.W)
+        ttk.Label(left_rem, text="Остаток к сборке").pack(anchor=tk.W)
         self.fbs_remaining_tree = ttk.Treeview(
             left_rem,
             columns=("sku", "name", "qty", "barcode"),
-            show="headings",
+            show="tree headings",
             height=10,
+            style="FbsThumb.Treeview",
         )
+        self.fbs_remaining_tree.heading("#0", text="")
         self.fbs_remaining_tree.heading("sku", text="Артикул")
         self.fbs_remaining_tree.heading("name", text="Название")
         self.fbs_remaining_tree.heading("qty", text="Ост.")
         self.fbs_remaining_tree.heading("barcode", text="ШК")
-        self.fbs_remaining_tree.column("sku", width=100, stretch=False)
-        self.fbs_remaining_tree.column("name", width=200)
-        self.fbs_remaining_tree.column("qty", width=50, stretch=False)
-        self.fbs_remaining_tree.column("barcode", width=120, stretch=False)
+        self.fbs_remaining_tree.column("#0", width=40, stretch=False, minwidth=36)
+        self.fbs_remaining_tree.column("sku", width=90, stretch=False)
+        self.fbs_remaining_tree.column("name", width=180)
+        self.fbs_remaining_tree.column("qty", width=46, stretch=False)
+        self.fbs_remaining_tree.column("barcode", width=110, stretch=False)
         self.fbs_remaining_tree.pack(fill=tk.BOTH, expand=True)
         self.fbs_remaining_tree.bind("<<TreeviewSelect>>", self.on_fbs_remaining_select)
         self.fbs_remaining_tree.bind("<Double-1>", self.on_fbs_remaining_pick)
+        _TreeHoverTip(self.fbs_remaining_tree, self._fbs_remaining_tip)
 
         right_rem = ttk.Frame(remaining_wrap)
         right_rem.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0))
         ttk.Label(right_rem, text="ШК для сканера").pack(anchor=tk.W)
-        self.fbs_barcode_canvas = tk.Label(right_rem, background="#fff", relief=tk.SOLID, borderwidth=1)
-        self.fbs_barcode_canvas.pack(pady=6)
+        barcode_box = tk.Frame(
+            right_rem,
+            width=_FBS_BARCODE_W,
+            height=_FBS_BARCODE_H,
+            background="#fff",
+            highlightthickness=1,
+            highlightbackground="#ccc",
+        )
+        barcode_box.pack(pady=6)
+        barcode_box.pack_propagate(False)
+        self.fbs_barcode_canvas = tk.Label(barcode_box, background="#fff")
+        self.fbs_barcode_canvas.pack(fill=tk.BOTH, expand=True)
         ttk.Button(right_rem, text="Взять (тап)", command=self.on_fbs_remaining_pick).pack(fill=tk.X)
 
         self.fbs_lines_frame = ttk.LabelFrame(right, text="Строки задания", padding=6)
@@ -166,23 +307,211 @@ class FbsPackingMixin:
         self.fbs_lines_tree = ttk.Treeview(
             self.fbs_lines_frame,
             columns=("seq", "sku", "order", "status"),
-            show="headings",
+            show="tree headings",
             height=8,
+            style="FbsThumb.Treeview",
         )
+        self.fbs_lines_tree.heading("#0", text="")
         self.fbs_lines_tree.heading("seq", text="#")
         self.fbs_lines_tree.heading("sku", text="Артикул")
         self.fbs_lines_tree.heading("order", text="Заказ")
         self.fbs_lines_tree.heading("status", text="Статус")
-        self.fbs_lines_tree.column("seq", width=40, stretch=False)
-        self.fbs_lines_tree.column("sku", width=120, stretch=False)
+        self.fbs_lines_tree.column("#0", width=40, stretch=False, minwidth=36)
+        self.fbs_lines_tree.column("seq", width=36, stretch=False)
+        self.fbs_lines_tree.column("sku", width=110, stretch=False)
         self.fbs_lines_tree.column("order", width=140)
         self.fbs_lines_tree.column("status", width=90, stretch=False)
         self.fbs_lines_tree.pack(fill=tk.BOTH, expand=True)
+        self.fbs_lines_tree.bind("<Button-3>", self._fbs_lines_context_menu)
+        _TreeHoverTip(self.fbs_lines_tree, self._fbs_lines_tip)
 
     def _fbs_save_skip_mp_setting(self) -> None:
         cfg = load_config()
         cfg["fbs_skip_mp_confirm"] = "1" if self.fbs_skip_mp_var.get() else "0"
         save_config(cfg)
+        if self.fbs_job:
+            self._fbs_render_job()
+
+    def _fbs_shrink_jobs_pane(self) -> None:
+        try:
+            self.update_idletasks()
+            self.fbs_panes.sashpos(0, _FBS_JOBS_SASH_PX)
+        except Exception:
+            pass
+
+    def _fbs_jobs_tip(self, row: str, col: str) -> str:
+        values = self.fbs_jobs_tree.item(row, "values") or ()
+        if not values:
+            return ""
+        mapping = {"#1": 0, "#2": 1, "#3": 2}
+        idx = mapping.get(col)
+        if idx is None or idx >= len(values):
+            return " · ".join(str(v) for v in values)
+        return str(values[idx] or "")
+
+    def _fbs_remaining_tip(self, row: str, col: str) -> str:
+        values = self.fbs_remaining_tree.item(row, "values") or ()
+        if not values:
+            return ""
+        mapping = {"#1": 0, "#2": 1, "#3": 2, "#4": 3}
+        idx = mapping.get(col)
+        if idx is None:
+            return " · ".join(str(v) for v in values if v)
+        if idx >= len(values):
+            return ""
+        return str(values[idx] or "")
+
+    def _fbs_lines_tip(self, row: str, col: str) -> str:
+        values = self.fbs_lines_tree.item(row, "values") or ()
+        if not values:
+            return ""
+        job = self.fbs_job or {}
+        line = next((item for item in (job.get("lines") or []) if str(item.get("id")) == str(row)), None)
+        name = str((line or {}).get("product_name") or "")
+        mapping = {"#1": 0, "#2": 1, "#3": 2, "#4": 3}
+        idx = mapping.get(col)
+        if col == "#0":
+            return name
+        if idx is None:
+            parts = [str(v) for v in values if v]
+            if name:
+                parts.append(name)
+            return " · ".join(parts)
+        if idx >= len(values):
+            return name
+        text = str(values[idx] or "")
+        if idx == 1 and name:
+            return f"{text}\n{name}" if text else name
+        return text
+
+    def _fbs_thumb_photo(self, url: str, size: int) -> ImageTk.PhotoImage | None:
+        raw = str(url or "").strip()
+        if not raw:
+            return None
+        key = f"{size}:{raw}"
+        cached = self._fbs_photo_cache.get(key)
+        if cached is not None:
+            return cached
+        data = get_cached_bytes(raw)
+        if not data:
+            self._fbs_ensure_image(raw)
+            return None
+        try:
+            img = Image.open(io.BytesIO(data))
+            img.thumbnail((size, size))
+            photo = ImageTk.PhotoImage(img)
+        except Exception:
+            return None
+        self._fbs_photo_cache[key] = photo
+        return photo
+
+    def _fbs_ensure_image(self, url: str) -> None:
+        raw = str(url or "").strip()
+        if not begin_fetch(raw):
+            return
+
+        def worker():
+            return raw, fetch_url(raw)
+
+        def on_ok(result: tuple[str, bytes | None]) -> None:
+            _url, data = result
+            if data:
+                self._fbs_apply_loaded_images()
+
+        self._run_task(worker, on_ok, lambda _exc: None)
+
+    def _fbs_apply_loaded_images(self) -> None:
+        for iid, url in list(self._fbs_line_urls.items()):
+            if not self.fbs_lines_tree.exists(iid):
+                continue
+            photo = self._fbs_thumb_photo(url, _FBS_LIST_IMG)
+            if photo is not None:
+                self.fbs_lines_tree.item(iid, image=photo)
+        for iid, url in list(self._fbs_remaining_urls.items()):
+            if not self.fbs_remaining_tree.exists(iid):
+                continue
+            photo = self._fbs_thumb_photo(url, _FBS_LIST_IMG)
+            if photo is not None:
+                self.fbs_remaining_tree.item(iid, image=photo)
+        self._fbs_refresh_active_image()
+
+    def _fbs_set_active_image(self, url: str) -> None:
+        photo = self._fbs_thumb_photo(url, _FBS_ACTIVE_IMG) if url else None
+        self._fbs_active_photo = photo
+        if photo is not None:
+            self.fbs_active_image.config(image=photo, text="")
+        else:
+            self.fbs_active_image.config(image="", text="")
+        if url and photo is None:
+            self._fbs_ensure_image(url)
+
+    def _fbs_refresh_active_image(self) -> None:
+        job = self.fbs_job or {}
+        active_lines = job.get("active_lines") or ([] if not job.get("active_line") else [job.get("active_line")])
+        if active_lines:
+            self._fbs_set_active_image(str(active_lines[0].get("image_url") or ""))
+            return
+        last = self._fbs_last_picked_line()
+        if self._fbs_skip_mp_enabled() and last:
+            self._fbs_set_active_image(str(last.get("image_url") or ""))
+            return
+        self._fbs_set_active_image("")
+
+    def _fbs_last_picked_line(self) -> dict | None:
+        job = self.fbs_job or {}
+        ids = {int(x) for x in self._fbs_last_scan_line_ids if str(x).strip()}
+        if not ids:
+            return None
+        for line in job.get("lines") or []:
+            try:
+                if int(line.get("id")) in ids:
+                    return line
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _fbs_lines_context_menu(self, event) -> None:
+        iid = self.fbs_lines_tree.identify_row(event.y)
+        if not iid:
+            return
+        self.fbs_lines_tree.selection_set(iid)
+        job = self.fbs_job or {}
+        line = next((item for item in (job.get("lines") or []) if str(item.get("id")) == str(iid)), None)
+        status = str((line or {}).get("status") or "")
+        menu = tk.Menu(self, tearoff=0)
+        if status in {"printed", "done"}:
+            menu.add_command(
+                label="Статус: в сборке",
+                command=lambda: self._fbs_set_line_status(int(iid), "pending"),
+            )
+        else:
+            menu.add_command(
+                label="Статус: готово",
+                command=lambda: self._fbs_set_line_status(int(iid), "done"),
+            )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _fbs_set_line_status(self, line_id: int, status: str) -> None:
+        job = self.fbs_job
+        if not job:
+            return
+        if not self._fbs_require_api():
+            return
+        job_id = int(job["id"])
+
+        def worker():
+            return self.client.fbs_set_line_status(job_id, line_id, status)
+
+        def on_ok(payload: dict) -> None:
+            self.fbs_job = payload.get("job") or self.fbs_job
+            self._fbs_render_job()
+            self.set_status(f"Статус строки: {_fbs_line_status_ru(status)}")
+            self._fbs_focus_scan()
+
+        self._fbs_run(worker, on_ok, status="Смена статуса...")
 
     def _fbs_scan_key(self, code: str) -> str:
         return str(code or "").strip().casefold()
@@ -388,7 +717,7 @@ class FbsPackingMixin:
                     "",
                     tk.END,
                     iid=jid,
-                    values=(jid, job.get("status") or "", f"{done}/{total}"),
+                    values=(jid, _fbs_job_status_ru(job.get("status")), f"{done}/{total}"),
                 )
             if selected and self.fbs_jobs_tree.exists(selected):
                 self.fbs_jobs_tree.selection_set(selected)
@@ -456,25 +785,43 @@ class FbsPackingMixin:
                     f"в печати {len(active_lines)} шт. · заказы: {orders} · "
                     f"пропикайте ярлыки подряд"
                 )
+            self._fbs_set_active_image(str(first.get("image_url") or ""))
         else:
-            hint = "пикните КИЗ или товар" if job.get("require_cis") else "пикните товар"
-            if self._fbs_skip_mp_enabled():
-                hint += " (без подтверждения ШК МП)"
-            self.fbs_active_var.set(f"Нет активной строки — {hint}")
+            last = self._fbs_last_picked_line()
+            if self._fbs_skip_mp_enabled() and last:
+                cis_note = " · КИЗ" if last.get("has_cis") else ""
+                self.fbs_active_var.set(
+                    f"SKU {last.get('sku')} · {last.get('product_name') or ''} · "
+                    f"заказ {last.get('order_display') or last.get('order_id')} · "
+                    f"строка #{last.get('id')}{cis_note}"
+                )
+                self._fbs_set_active_image(str(last.get("image_url") or ""))
+            else:
+                hint = "пикните КИЗ или товар" if job.get("require_cis") else "пикните товар"
+                if self._fbs_skip_mp_enabled():
+                    hint += " (без подтверждения ШК МП)"
+                self.fbs_active_var.set(f"Нет активной строки — {hint}")
+                self._fbs_set_active_image("")
 
         self.fbs_lines_tree.delete(*self.fbs_lines_tree.get_children())
+        self._fbs_line_urls = {}
         for line in job.get("lines") or []:
-            self.fbs_lines_tree.insert(
-                "",
-                tk.END,
-                iid=str(line.get("id")),
-                values=(
+            iid = str(line.get("id"))
+            url = str(line.get("image_url") or "")
+            self._fbs_line_urls[iid] = url
+            photo = self._fbs_thumb_photo(url, _FBS_LIST_IMG) if url else None
+            kwargs: dict[str, Any] = {
+                "iid": iid,
+                "values": (
                     line.get("seq", ""),
                     line.get("sku", ""),
                     line.get("order_display") or line.get("order_id") or "",
-                    line.get("status", ""),
+                    _fbs_line_status_ru(line.get("status")),
                 ),
-            )
+            }
+            if photo is not None:
+                kwargs["image"] = photo
+            self.fbs_lines_tree.insert("", tk.END, **kwargs)
         if self.fbs_manual_var.get():
             self._fbs_render_remaining()
 
@@ -482,18 +829,24 @@ class FbsPackingMixin:
         job = self.fbs_job or {}
         groups = job.get("remaining_groups") or []
         self.fbs_remaining_tree.delete(*self.fbs_remaining_tree.get_children())
+        self._fbs_remaining_urls = {}
         for idx, group in enumerate(groups):
-            self.fbs_remaining_tree.insert(
-                "",
-                tk.END,
-                iid=str(idx),
-                values=(
+            iid = str(idx)
+            url = str(group.get("image_url") or "")
+            self._fbs_remaining_urls[iid] = url
+            photo = self._fbs_thumb_photo(url, _FBS_LIST_IMG) if url else None
+            kwargs: dict[str, Any] = {
+                "iid": iid,
+                "values": (
                     group.get("sku") or "",
                     group.get("name") or "",
                     group.get("quantity") or 0,
                     group.get("barcode") or "",
                 ),
-            )
+            }
+            if photo is not None:
+                kwargs["image"] = photo
+            self.fbs_remaining_tree.insert("", tk.END, **kwargs)
         if groups:
             self.fbs_remaining_tree.selection_set("0")
             self.fbs_remaining_tree.focus("0")
@@ -522,16 +875,15 @@ class FbsPackingMixin:
 
     def _fbs_show_barcode_image(self, code: str) -> None:
         code = (code or "").strip()
+        box_w = max(8, _FBS_BARCODE_W - 10)
+        box_h = max(8, _FBS_BARCODE_H - 10)
         if not code:
-            self.fbs_barcode_canvas.config(image="", text="нет ШК\n(возьмите тапом)")
+            self.fbs_barcode_canvas.config(image="", text="нет ШК")
             self._fbs_barcode_photo = None
             return
         try:
             img = render_code128_image(code)
-            # Enlarge for handheld scanner from monitor
-            w, h = img.size
-            scale = max(2, min(4, 360 // max(w, 1)))
-            img = img.resize((w * scale, h * scale))
+            img.thumbnail((box_w, box_h))
             photo = ImageTk.PhotoImage(img)
             self._fbs_barcode_photo = photo
             self.fbs_barcode_canvas.config(image=photo, text="")
@@ -673,6 +1025,16 @@ class FbsPackingMixin:
                 [payload.get("line")] if payload.get("line") else []
             )
             line = (closed_lines[0] if closed_lines else None) or allocate_line or {}
+            if skip_mp:
+                printed_ids = [
+                    int(item["id"])
+                    for item in (lines or [])
+                    if item and item.get("id")
+                ]
+                if printed_ids:
+                    self._fbs_last_scan_code = scan_code or self._fbs_scan_key(str((line or {}).get("sku") or ""))
+                    self._fbs_last_scan_sku = str((line or {}).get("sku") or "")
+                    self._fbs_last_scan_line_ids = printed_ids
             self._fbs_render_job()
             if print_error is not None:
                 messagebox.showerror("Печать", str(print_error))
@@ -685,16 +1047,6 @@ class FbsPackingMixin:
                 messagebox.showwarning("FBS", f"Ярлык напечатан, но строка не закрыта: {close_error}")
             sku = line.get("sku") if line else ""
             cis_note = " · КИЗ записан" if line and line.get("has_cis") else ""
-            if skip_mp:
-                printed_ids = [
-                    int(item["id"])
-                    for item in (lines or [])
-                    if item and item.get("id")
-                ]
-                if printed_ids:
-                    self._fbs_last_scan_code = scan_code or self._fbs_scan_key(str(sku or ""))
-                    self._fbs_last_scan_sku = str(sku or "")
-                    self._fbs_last_scan_line_ids = printed_ids
             if printed > 1:
                 if skip_mp:
                     self.set_status(f"Готово · SKU {sku} · ярлыков {printed} · пикайте следующий")
@@ -762,7 +1114,7 @@ class FbsPackingMixin:
         def on_ok(payload: dict) -> None:
             self.fbs_job = payload.get("job") or self.fbs_job
             self._fbs_render_job()
-            self.set_status("Печать отменена, КИЗ сброшен, строки снова pending")
+            self.set_status("Печать отменена, КИЗ сброшен, строки снова в сборке")
             self._fbs_focus_scan()
 
         self._fbs_run(worker, on_ok, status="Отмена...")

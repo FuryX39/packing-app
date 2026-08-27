@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Callable
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 from api_client import ApiError, AuthError
 from image_cache import begin_fetch, fetch_url, get_cached_bytes
@@ -37,6 +39,8 @@ _FBS_BARCODE_W = 180
 _FBS_BARCODE_H = 80
 _FBS_ACTIVE_IMG = 110
 _FBS_LIST_IMG = 32
+_FBS_SEQ_COL_W = 40
+_FBS_LINE_TREE0_W = _FBS_SEQ_COL_W + 6 + _FBS_LIST_IMG
 
 
 def _fbs_job_status_ru(value: object) -> str:
@@ -133,6 +137,7 @@ class FbsPackingMixin:
         self._fbs_active_photo: ImageTk.PhotoImage | None = None
         self._fbs_photo_cache: dict[str, ImageTk.PhotoImage] = {}
         self._fbs_line_urls: dict[str, str] = {}
+        self._fbs_line_seqs: dict[str, str] = {}
         self._fbs_remaining_urls: dict[str, str] = {}
         self._fbs_selected_group: dict | None = None
         self._fbs_last_scan_code = ""
@@ -147,7 +152,7 @@ class FbsPackingMixin:
         tab = ttk.Frame(self.notebook, padding=6)
         self.notebook.add(tab, text="Упаковка FBS")
         style = ttk.Style(self)
-        style.configure("FbsThumb.Treeview", rowheight=36)
+        style.configure("FbsThumb.Treeview", rowheight=36, indent=0)
 
         toolbar = ttk.Frame(tab)
         toolbar.pack(fill=tk.X, pady=(0, 8))
@@ -310,18 +315,16 @@ class FbsPackingMixin:
         self.fbs_lines_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         self.fbs_lines_tree = ttk.Treeview(
             self.fbs_lines_frame,
-            columns=("seq", "sku", "order", "status"),
+            columns=("sku", "order", "status"),
             show="tree headings",
             height=8,
             style="FbsThumb.Treeview",
         )
-        self.fbs_lines_tree.heading("#0", text="")
-        self.fbs_lines_tree.heading("seq", text="#")
+        self.fbs_lines_tree.heading("#0", text="№")
         self.fbs_lines_tree.heading("sku", text="Артикул")
         self.fbs_lines_tree.heading("order", text="Заказ")
         self.fbs_lines_tree.heading("status", text="Статус")
-        self.fbs_lines_tree.column("#0", width=40, stretch=False, minwidth=36)
-        self.fbs_lines_tree.column("seq", width=36, stretch=False)
+        self.fbs_lines_tree.column("#0", width=_FBS_LINE_TREE0_W, stretch=False, minwidth=_FBS_LINE_TREE0_W)
         self.fbs_lines_tree.column("sku", width=110, stretch=False)
         self.fbs_lines_tree.column("order", width=140)
         self.fbs_lines_tree.column("status", width=90, stretch=False)
@@ -360,26 +363,52 @@ class FbsPackingMixin:
 
     def _fbs_lines_tip(self, row: str, col: str) -> str:
         values = self.fbs_lines_tree.item(row, "values") or ()
-        if not values:
-            return ""
         job = self.fbs_job or {}
         line = next((item for item in (job.get("lines") or []) if str(item.get("id")) == str(row)), None)
         name = str((line or {}).get("product_name") or "")
-        mapping = {"#1": 0, "#2": 1, "#3": 2, "#4": 3}
-        idx = mapping.get(col)
+        seq = str((line or {}).get("seq") or "")
         if col == "#0":
-            return name
+            return " ".join(part for part in (seq, name) if part)
+        mapping = {"#1": 0, "#2": 1, "#3": 2}
+        idx = mapping.get(col)
         if idx is None:
-            parts = [str(v) for v in values if v]
+            parts = [seq] + [str(v) for v in values if v]
             if name:
                 parts.append(name)
             return " · ".join(parts)
         if idx >= len(values):
             return name
         text = str(values[idx] or "")
-        if idx == 1 and name:
+        if idx == 0 and name:
             return f"{text}\n{name}" if text else name
         return text
+
+    def _fbs_ui_font(self, size: int = 12) -> ImageFont.ImageFont:
+        windir = os.environ.get("WINDIR") or r"C:\Windows"
+        for name in ("segoeui.ttf", "tahoma.ttf", "arial.ttf"):
+            path = Path(windir) / "Fonts" / name
+            if not path.is_file():
+                continue
+            try:
+                return ImageFont.truetype(str(path), size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    def _fbs_thumb_pil(self, url: str, size: int) -> Image.Image | None:
+        raw = str(url or "").strip()
+        if not raw:
+            return None
+        data = get_cached_bytes(raw)
+        if not data:
+            self._fbs_ensure_image(raw)
+            return None
+        try:
+            img = Image.open(io.BytesIO(data))
+            img.thumbnail((size, size))
+            return img.convert("RGB")
+        except Exception:
+            return None
 
     def _fbs_thumb_photo(self, url: str, size: int) -> ImageTk.PhotoImage | None:
         raw = str(url or "").strip()
@@ -389,16 +418,44 @@ class FbsPackingMixin:
         cached = self._fbs_photo_cache.get(key)
         if cached is not None:
             return cached
-        data = get_cached_bytes(raw)
-        if not data:
-            self._fbs_ensure_image(raw)
+        img = self._fbs_thumb_pil(raw, size)
+        if img is None:
             return None
-        try:
-            img = Image.open(io.BytesIO(data))
-            img.thumbnail((size, size))
-            photo = ImageTk.PhotoImage(img)
-        except Exception:
-            return None
+        photo = ImageTk.PhotoImage(img)
+        self._fbs_photo_cache[key] = photo
+        return photo
+
+    def _fbs_line_row_photo(self, seq: object, url: str) -> ImageTk.PhotoImage:
+        label = str(seq or "").strip()
+        raw = str(url or "").strip()
+        key = f"row:{label}:{raw}:{_FBS_LIST_IMG}"
+        cached = self._fbs_photo_cache.get(key)
+        if cached is not None:
+            return cached
+        height = max(36, _FBS_LIST_IMG)
+        canvas = Image.new("RGB", (_FBS_LINE_TREE0_W, height), (255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+        font = self._fbs_ui_font(12)
+        bbox = draw.textbbox((0, 0), label or "·", font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text(
+            ((_FBS_SEQ_COL_W - tw) / 2 - bbox[0], (height - th) / 2 - bbox[1]),
+            label or "·",
+            fill=(30, 30, 30),
+            font=font,
+        )
+        thumb = self._fbs_thumb_pil(raw, _FBS_LIST_IMG)
+        x = _FBS_SEQ_COL_W + 4
+        y = (height - _FBS_LIST_IMG) // 2
+        if thumb is None:
+            draw.rectangle(
+                (x, y, x + _FBS_LIST_IMG - 1, y + _FBS_LIST_IMG - 1),
+                outline=(200, 200, 200),
+                fill=(243, 243, 243),
+            )
+        else:
+            canvas.paste(thumb, (x, y + (_FBS_LIST_IMG - thumb.size[1]) // 2))
+        photo = ImageTk.PhotoImage(canvas)
         self._fbs_photo_cache[key] = photo
         return photo
 
@@ -421,9 +478,8 @@ class FbsPackingMixin:
         for iid, url in list(self._fbs_line_urls.items()):
             if not self.fbs_lines_tree.exists(iid):
                 continue
-            photo = self._fbs_thumb_photo(url, _FBS_LIST_IMG)
-            if photo is not None:
-                self.fbs_lines_tree.item(iid, image=photo)
+            seq = self._fbs_line_seqs.get(iid, "")
+            self.fbs_lines_tree.item(iid, image=self._fbs_line_row_photo(seq, url))
         for iid, url in list(self._fbs_remaining_urls.items()):
             if not self.fbs_remaining_tree.exists(iid):
                 continue
@@ -802,23 +858,24 @@ class FbsPackingMixin:
 
         self.fbs_lines_tree.delete(*self.fbs_lines_tree.get_children())
         self._fbs_line_urls = {}
+        self._fbs_line_seqs = {}
         for line in job.get("lines") or []:
             iid = str(line.get("id"))
             url = str(line.get("image_url") or "")
+            seq = line.get("seq", "")
             self._fbs_line_urls[iid] = url
-            photo = self._fbs_thumb_photo(url, _FBS_LIST_IMG) if url else None
-            kwargs: dict[str, Any] = {
-                "iid": iid,
-                "values": (
-                    line.get("seq", ""),
+            self._fbs_line_seqs[iid] = str(seq or "")
+            self.fbs_lines_tree.insert(
+                "",
+                tk.END,
+                iid=iid,
+                image=self._fbs_line_row_photo(seq, url),
+                values=(
                     line.get("sku", ""),
                     line.get("order_display") or line.get("order_id") or "",
                     _fbs_line_status_ru(line.get("status")),
                 ),
-            }
-            if photo is not None:
-                kwargs["image"] = photo
-            self.fbs_lines_tree.insert("", tk.END, **kwargs)
+            )
         if self.fbs_manual_var.get():
             self._fbs_render_remaining()
 

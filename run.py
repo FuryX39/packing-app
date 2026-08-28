@@ -9,6 +9,7 @@ import ctypes
 
 from api_client import AuthError, WarehouseApiClient
 from fbs_packing_ui import FbsPackingMixin, _FBS_LIST_IMG, _TreeHoverTip
+from paging import PageBar, catalog_matches
 from label_cache import cache_summary, clear_except, format_cache_size
 from local_print import barcode_label_pdf, print_pdf
 from packing_config import load_config, parse_label_size_mm, save_config
@@ -413,6 +414,9 @@ class PackingApp(FbsPackingMixin, tk.Tk):
         search_entry.bind("<KeyRelease>", self._on_catalog_search_key)
         ttk.Button(search_row, text="Найти", command=self.load_catalog).pack(side=tk.LEFT)
         ttk.Button(search_row, text="Обновить", command=lambda: self.load_catalog(force_reload=True)).pack(side=tk.LEFT, padx=6)
+
+        self.catalog_pager = PageBar(tab, on_change=self._render_catalog_page)
+        self.catalog_pager.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
 
         tree_wrap = ttk.Frame(tab)
         tree_wrap.pack(fill=tk.BOTH, expand=True)
@@ -1029,7 +1033,7 @@ class PackingApp(FbsPackingMixin, tk.Tk):
 
         def on_barcodes(barcodes: list[dict[str, str]]) -> None:
             self.catalog_barcode_cache[product_id] = barcodes
-            self.set_status(f"Товаров: {len(self.catalog_products)}")
+            self.set_status(self._catalog_status_text())
             self._show_barcode_pick_menu(product, barcodes, x_root, y_root)
 
         def on_error(exc: Exception) -> None:
@@ -1038,15 +1042,32 @@ class PackingApp(FbsPackingMixin, tk.Tk):
         self.set_status("Загрузка штрихкодов...")
         self._run_task(worker, on_barcodes, on_error)
 
+    def _catalog_status_text(self) -> str:
+        total = len(self.catalog_products)
+        all_count = len(self.catalog_products_all)
+        query = self.catalog_search_var.get().strip()
+        if query:
+            prefix = f"Найдено: {total} из {all_count}"
+        else:
+            prefix = f"Товаров: {total}"
+        if total <= 0:
+            return prefix
+        start = self.catalog_pager.page * self.catalog_pager.page_size + 1
+        end = min(total, (self.catalog_pager.page + 1) * self.catalog_pager.page_size)
+        return f"{prefix} · {start}–{end}"
+
+    def _render_catalog_page(self) -> None:
+        visible = self.catalog_pager.slice_items(self.catalog_products)
+        self._render_catalog_tree(visible)
+        self.set_status(self._catalog_status_text())
+
     def _apply_catalog_filter(self, query: str) -> None:
         if query:
             self.catalog_products = [p for p in self.catalog_products_all if self._catalog_matches(p, query)]
-            status = f"Найдено: {len(self.catalog_products)} из {len(self.catalog_products_all)}"
         else:
             self.catalog_products = list(self.catalog_products_all)
-            status = f"Товаров: {len(self.catalog_products)}"
-        self._render_catalog_tree(self.catalog_products)
-        self.set_status(status)
+        self.catalog_pager.reset()
+        self._render_catalog_page()
 
     def load_catalog(self, *, force_reload: bool = False) -> None:
         if self._catalog_search_job is not None:
@@ -1102,14 +1123,7 @@ class PackingApp(FbsPackingMixin, tk.Tk):
         self._catalog_search_job = self.after(400, self.load_catalog)
 
     def _catalog_matches(self, product: dict, query: str) -> bool:
-        fields = (
-            product.get("name", ""),
-            product.get("sku", ""),
-            product.get("code", ""),
-            product.get("external_code", ""),
-            product.get("group_name", ""),
-        )
-        return any(query in str(field or "").casefold() for field in fields)
+        return catalog_matches(product, query)
 
     def _print_catalog_barcode_item(self, product: dict, barcode_item: dict[str, str]) -> None:
         barcode = str(barcode_item.get("barcode") or "").strip()

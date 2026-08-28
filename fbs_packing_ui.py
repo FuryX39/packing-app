@@ -20,6 +20,7 @@ from label_cache import (
 )
 from local_print import print_pdf, render_code128_image
 from packing_config import load_config, save_config
+from paging import PageBar
 
 _FBS_JOB_STATUS_RU = {
     "open": "Открыто",
@@ -317,6 +318,8 @@ class FbsPackingMixin:
         self._fbs_last_scan_sku = ""
         self._fbs_last_scan_line_ids: list[int] = []
         self._fbs_prefetching_job_id: int | None = None
+        self._fbs_jobs_filling = False
+        self._fbs_paged_job_id: object | None = None
         cfg = load_config()
         skip_raw = str(cfg.get("fbs_skip_mp_confirm") or "").strip().lower()
         self.fbs_skip_mp_var = tk.BooleanVar(value=skip_raw in {"1", "true", "yes", "on"})
@@ -353,6 +356,8 @@ class FbsPackingMixin:
             pass
 
         ttk.Label(left, text="Мои задания FBS").pack(anchor=tk.W)
+        self.fbs_jobs_pager = PageBar(left, on_change=self._fbs_render_jobs_tree)
+        self.fbs_jobs_pager.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
         self.fbs_jobs_tree = ttk.Treeview(
             left,
             columns=("id", "status", "progress"),
@@ -486,6 +491,8 @@ class FbsPackingMixin:
 
         self.fbs_lines_frame = ttk.LabelFrame(right, text="Строки задания", padding=6)
         self.fbs_lines_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self.fbs_lines_pager = PageBar(self.fbs_lines_frame, on_change=self._fbs_fill_lines_table)
+        self.fbs_lines_pager.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
         self.fbs_lines_table = _FbsLinesTable(
             self.fbs_lines_frame,
             on_context=self._fbs_lines_context_menu,
@@ -856,11 +863,27 @@ class FbsPackingMixin:
 
         def on_ok(jobs: list[dict]) -> None:
             self.fbs_jobs = jobs
-            selected = None
-            if self.fbs_job:
-                selected = str(self.fbs_job.get("id") or "")
+            selected = str((self.fbs_job or {}).get("id") or "")
+            if selected:
+                for index, job in enumerate(jobs):
+                    if str(job.get("id") or "") == selected:
+                        self.fbs_jobs_pager.show_index(index)
+                        break
+            self._fbs_render_jobs_tree()
+            self.set_status(f"FBS заданий: {len(jobs)}")
+            self._fbs_focus_scan()
+
+        self.set_status("Загрузка FBS...")
+        self._run_task(worker, on_ok)
+
+    def _fbs_render_jobs_tree(self) -> None:
+        jobs = self.fbs_jobs
+        selected = str((self.fbs_job or {}).get("id") or "")
+        visible = self.fbs_jobs_pager.slice_items(jobs)
+        self._fbs_jobs_filling = True
+        try:
             self.fbs_jobs_tree.delete(*self.fbs_jobs_tree.get_children())
-            for job in jobs:
+            for job in visible:
                 jid = str(job.get("id") or "")
                 done = job.get("line_done", 0)
                 total = job.get("line_total", 0)
@@ -873,13 +896,15 @@ class FbsPackingMixin:
             if selected and self.fbs_jobs_tree.exists(selected):
                 self.fbs_jobs_tree.selection_set(selected)
                 self.fbs_jobs_tree.focus(selected)
-            self.set_status(f"FBS заданий: {len(jobs)}")
-            self._fbs_focus_scan()
-
-        self.set_status("Загрузка FBS...")
-        self._run_task(worker, on_ok)
+            else:
+                for item in self.fbs_jobs_tree.selection():
+                    self.fbs_jobs_tree.selection_remove(item)
+        finally:
+            self._fbs_jobs_filling = False
 
     def on_fbs_job_select(self, _event=None) -> None:
+        if self._fbs_jobs_filling:
+            return
         selected = self.fbs_jobs_tree.selection()
         if not selected:
             return
@@ -954,9 +979,26 @@ class FbsPackingMixin:
                 self.fbs_active_var.set(f"Нет активной строки — {hint}")
                 self._fbs_set_active_image("")
 
+        if getattr(self, "_fbs_paged_job_id", None) != jid:
+            self.fbs_lines_pager.reset()
+            self._fbs_paged_job_id = jid
+        if active_lines:
+            active_id = str(active_lines[0].get("id") or "")
+            for index, line in enumerate(job.get("lines") or []):
+                if str(line.get("id") or "") == active_id:
+                    self.fbs_lines_pager.show_index(index)
+                    break
+        self._fbs_fill_lines_table()
+        if self.fbs_manual_var.get():
+            self._fbs_render_remaining()
+
+    def _fbs_fill_lines_table(self) -> None:
+        job = self.fbs_job or {}
+        lines = list(job.get("lines") or [])
+        visible = self.fbs_lines_pager.slice_items(lines)
         self.fbs_lines_table.clear()
         self._fbs_line_urls = {}
-        for line in job.get("lines") or []:
+        for line in visible:
             iid = str(line.get("id"))
             url = str(line.get("image_url") or "")
             self._fbs_line_urls[iid] = url
@@ -974,8 +1016,6 @@ class FbsPackingMixin:
                 photo=self._fbs_thumb_photo(url, _FBS_LIST_IMG) if url else None,
                 tip=tip,
             )
-        if self.fbs_manual_var.get():
-            self._fbs_render_remaining()
 
     def _fbs_render_remaining(self) -> None:
         job = self.fbs_job or {}

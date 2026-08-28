@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import io
+import os
 import re
+import sys
 import threading
+from pathlib import Path
 from typing import Any
 
 from barcode import Code128
@@ -29,6 +32,57 @@ _HORZRES = 8
 _VERTRES = 10
 _LOGPIXELSX = 88
 _LOGPIXELSY = 90
+_PYWIN32_READY = False
+
+
+def _ensure_pywin32() -> None:
+    """pywin32 часто стоит в pip, но DLL не в PATH этого Python (venv без postinstall)."""
+    global _PYWIN32_READY
+    if _PYWIN32_READY:
+        return
+    prefixes = [Path(sys.prefix)]
+    base = Path(getattr(sys, "base_prefix", sys.prefix) or sys.prefix)
+    if base not in prefixes:
+        prefixes.append(base)
+    folders: list[Path] = []
+    for root in prefixes:
+        site = root / "Lib" / "site-packages"
+        folders.extend(
+            (
+                site / "pywin32_system32",
+                site / "win32",
+                site / "win32" / "lib",
+            )
+        )
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    for folder in folders:
+        if not folder.is_dir():
+            continue
+        folder_s = str(folder)
+        if folder_s not in path_parts:
+            os.environ["PATH"] = folder_s + os.pathsep + os.environ.get("PATH", "")
+            path_parts.insert(0, folder_s)
+        add = getattr(os, "add_dll_directory", None)
+        if add is not None:
+            try:
+                add(folder_s)
+            except OSError:
+                pass
+    try:
+        import pywin32_bootstrap  # noqa: F401
+    except ImportError:
+        pass
+    _PYWIN32_READY = True
+
+
+def _pywin32_error(exc: BaseException) -> RuntimeError:
+    return RuntimeError(
+        "Не удалось загрузить pywin32 для печати.\n"
+        f"Этот Python: {sys.executable}\n"
+        f"Ошибка: {exc}\n"
+        "Запускайте start.bat (чтобы шёл .venv). "
+        "В том же Python: python -m pip install --force-reinstall pywin32"
+    )
 
 
 def _parse_print_settings(print_settings: str) -> dict[str, Any]:
@@ -78,6 +132,7 @@ def _rasterize_pdf(pdf_bytes: bytes, *, dpi: int) -> list[tuple[Image.Image, tup
 
 
 def _resolve_printer(name: str) -> str:
+    _ensure_pywin32()
     import win32print
 
     printers = [
@@ -96,6 +151,7 @@ def _resolve_printer(name: str) -> str:
 
 
 def _apply_devmode(devmode, options: dict[str, Any]) -> None:
+    _ensure_pywin32()
     import win32con
 
     if options["landscape"]:
@@ -154,6 +210,7 @@ def _gdi_print_pages(
     copies: int,
     options: dict[str, Any],
 ) -> None:
+    _ensure_pywin32()
     import win32gui
     import win32print
     import win32ui
@@ -209,10 +266,11 @@ def print_pdf(
     except ImportError as exc:
         raise RuntimeError("Установите pypdfium2: pip install pypdfium2") from exc
     try:
+        _ensure_pywin32()
         with _PRINT_LOCK:
             _gdi_print_pages(pages, printer=printer, copies=count, options=options)
-    except ImportError as exc:
-        raise RuntimeError("Установите pywin32: pip install pywin32") from exc
+    except (ImportError, OSError) as exc:
+        raise _pywin32_error(exc) from exc
 
 
 def _trim_barcode_whitespace(img: Image.Image) -> Image.Image:

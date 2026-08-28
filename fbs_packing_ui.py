@@ -123,9 +123,10 @@ class _TreeHoverTip:
 
 
 class _FbsLinesTable(ttk.Frame):
-    """Строки FBS: отдельные колонки №, фото, артикул, заказ, статус."""
+    """Строки FBS: отдельные колонки №, фото, артикул, название, заказ, статус."""
 
-    _MIN = (40, 40, 110, 140, 90)
+    _MIN = (40, 40, 90, 180, 120, 90)
+    _STRETCH_COL = 3
 
     def __init__(self, master, *, on_context) -> None:
         super().__init__(master)
@@ -136,8 +137,8 @@ class _FbsLinesTable(ttk.Frame):
 
         header = ttk.Frame(self)
         header.pack(fill=tk.X)
-        for i, title in enumerate(("№", "Фото", "Артикул", "Заказ", "Статус")):
-            header.grid_columnconfigure(i, minsize=self._MIN[i], weight=1 if i == 3 else 0)
+        for i, title in enumerate(("№", "Фото", "Артикул", "Название", "Заказ", "Статус")):
+            header.grid_columnconfigure(i, minsize=self._MIN[i], weight=1 if i == self._STRETCH_COL else 0)
             ttk.Label(header, text=title, anchor="w").grid(row=0, column=i, sticky="ew", padx=4, pady=2)
 
         body = ttk.Frame(self)
@@ -150,7 +151,7 @@ class _FbsLinesTable(ttk.Frame):
         self._inner = ttk.Frame(self._canvas)
         self._win = self._canvas.create_window((0, 0), window=self._inner, anchor="nw")
         for i, width in enumerate(self._MIN):
-            self._inner.grid_columnconfigure(i, minsize=width, weight=1 if i == 3 else 0)
+            self._inner.grid_columnconfigure(i, minsize=width, weight=1 if i == self._STRETCH_COL else 0)
         self._inner.bind("<Configure>", self._on_inner_configure)
         self._canvas.bind("<Configure>", self._on_canvas_configure)
         self._canvas.bind("<MouseWheel>", self._on_wheel)
@@ -181,6 +182,7 @@ class _FbsLinesTable(ttk.Frame):
         *,
         seq: object,
         sku: str,
+        name: str,
         order: str,
         status: str,
         photo: ImageTk.PhotoImage | None,
@@ -205,18 +207,21 @@ class _FbsLinesTable(ttk.Frame):
         sku_l = tk.Label(self._inner, text=sku, anchor="w", background=bg)
         sku_l.grid(row=row, column=2, sticky="nsew", padx=4, pady=3)
         widgets.append(sku_l)
+        name_l = tk.Label(self._inner, text=name, anchor="w", background=bg)
+        name_l.grid(row=row, column=3, sticky="nsew", padx=4, pady=3)
+        widgets.append(name_l)
         order_l = tk.Label(self._inner, text=order, anchor="w", background=bg)
-        order_l.grid(row=row, column=3, sticky="nsew", padx=4, pady=3)
+        order_l.grid(row=row, column=4, sticky="nsew", padx=4, pady=3)
         widgets.append(order_l)
         status_l = tk.Label(self._inner, text=status, anchor="w", background=bg)
-        status_l.grid(row=row, column=4, sticky="nsew", padx=4, pady=3)
+        status_l.grid(row=row, column=5, sticky="nsew", padx=4, pady=3)
         widgets.append(status_l)
         for widget in widgets:
             widget.bind("<Button-1>", lambda _e, key=iid: self.select(key))
             widget.bind("<Button-3>", lambda e, key=iid: self._context(e, key))
             widget.bind("<MouseWheel>", self._on_wheel)
         if tip:
-            for widget in (sku_l, order_l, seq_l):
+            for widget in (sku_l, name_l, order_l, seq_l):
                 self._bind_tip(widget, tip)
         self._rows[iid] = {
             "bg": bg,
@@ -573,6 +578,15 @@ class FbsPackingMixin:
             if photo is not None:
                 self.fbs_remaining_tree.item(iid, image=photo)
         self._fbs_refresh_active_image()
+        catalog_urls = getattr(self, "_catalog_image_urls", None)
+        catalog_tree = getattr(self, "catalog_tree", None)
+        if isinstance(catalog_urls, dict) and catalog_tree is not None:
+            for iid, url in list(catalog_urls.items()):
+                if not catalog_tree.exists(iid):
+                    continue
+                photo = self._fbs_thumb_photo(url, _FBS_LIST_IMG)
+                if photo is not None:
+                    catalog_tree.item(iid, image=photo)
 
     def _fbs_set_active_image(self, url: str) -> None:
         photo = self._fbs_thumb_photo(url, _FBS_ACTIVE_IMG) if url else None
@@ -954,6 +968,7 @@ class FbsPackingMixin:
                 iid,
                 seq=line.get("seq", ""),
                 sku=sku,
+                name=name,
                 order=order,
                 status=_fbs_line_status_ru(line.get("status")),
                 photo=self._fbs_thumb_photo(url, _FBS_LIST_IMG) if url else None,

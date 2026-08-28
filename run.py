@@ -8,7 +8,8 @@ import os
 import ctypes
 
 from api_client import AuthError, WarehouseApiClient
-from fbs_packing_ui import FbsPackingMixin
+from fbs_packing_ui import FbsPackingMixin, _FBS_LIST_IMG, _TreeHoverTip
+from label_cache import cache_summary, clear_except, format_cache_size
 from local_print import barcode_label_pdf, print_pdf
 from packing_config import load_config, parse_label_size_mm, save_config
 
@@ -228,9 +229,7 @@ class PackingApp(FbsPackingMixin, tk.Tk):
         self.catalog_products: list[dict] = []
         self.catalog_products_all: list[dict] = []
         self.catalog_barcode_cache: dict[int, list[dict[str, str]]] = {}
-        self.catalog_row_qty: dict[str, str] = {}
-        self._catalog_qty_entry: ttk.Entry | None = None
-        self._catalog_qty_edit_item: str | None = None
+        self._catalog_image_urls: dict[str, str] = {}
         self._catalog_loading = False
         self._catalog_search_job: str | None = None
         self._print_in_progress = False
@@ -255,7 +254,7 @@ class PackingApp(FbsPackingMixin, tk.Tk):
 
     def _configure_catalog_styles(self) -> None:
         style = ttk.Style(self)
-        style.configure("CatalogPrint.Treeview", rowheight=28)
+        style.configure("CatalogPrint.Treeview", rowheight=36, indent=0)
         style.configure("CatalogPrintHeading.Treeview.Heading", font=("Segoe UI", 9, "bold"))
 
     def _configure_tasks_styles(self) -> None:
@@ -399,12 +398,10 @@ class PackingApp(FbsPackingMixin, tk.Tk):
 
         qty_row = ttk.Frame(tab)
         qty_row.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(qty_row, text="Кол-во по умолчанию").pack(side=tk.LEFT)
+        ttk.Label(qty_row, text="Кол-во этикеток").pack(side=tk.LEFT)
         self.catalog_default_qty_var = tk.StringVar(value="1")
         ttk.Entry(qty_row, textvariable=self.catalog_default_qty_var, width=8).pack(side=tk.LEFT, padx=8)
-        ttk.Label(qty_row, text="(используется, если в строке товара кол-во не указано)", foreground="#666").pack(
-            side=tk.LEFT
-        )
+        ttk.Label(qty_row, text="для кнопки «Печать ШК»", foreground="#666").pack(side=tk.LEFT)
 
         search_row = ttk.Frame(tab)
         search_row.pack(fill=tk.X, pady=(0, 8))
@@ -419,29 +416,24 @@ class PackingApp(FbsPackingMixin, tk.Tk):
 
         tree_wrap = ttk.Frame(tab)
         tree_wrap.pack(fill=tk.BOTH, expand=True)
-        columns = ("code", "sku", "name", "group", "unit", "qty", "print")
         self.catalog_tree = ttk.Treeview(
             tree_wrap,
-            columns=columns,
-            show="headings",
+            columns=("sku", "name", "print"),
+            show="tree headings",
             style="CatalogPrint.Treeview",
         )
-        self.catalog_tree.heading("code", text="Код")
+        self.catalog_tree.heading("#0", text="Фото")
         self.catalog_tree.heading("sku", text="Артикул")
-        self.catalog_tree.heading("name", text="Наименование")
-        self.catalog_tree.heading("group", text="Группа")
-        self.catalog_tree.heading("unit", text="Ед. изм.")
-        self.catalog_tree.heading("qty", text="Кол-во")
-        self.catalog_tree.heading("print", text="Печать")
-        self.catalog_tree.column("code", width=80, stretch=False)
-        self.catalog_tree.column("sku", width=100, stretch=False)
-        self.catalog_tree.column("name", width=240)
-        self.catalog_tree.column("group", width=120)
-        self.catalog_tree.column("unit", width=70, stretch=False)
-        self.catalog_tree.column("qty", width=60, stretch=False, anchor=tk.CENTER)
-        self.catalog_tree.column("print", width=120, stretch=False, anchor=tk.CENTER)
+        self.catalog_tree.heading("name", text="Название")
+        self.catalog_tree.heading("print", text="Печать ШК")
+        self.catalog_tree.column("#0", width=52, stretch=False, minwidth=52)
+        self.catalog_tree.column("sku", width=120, stretch=False, minwidth=80)
+        self.catalog_tree.column("name", width=360, minwidth=160)
+        self.catalog_tree.column("print", width=120, stretch=False, minwidth=100, anchor=tk.CENTER)
         self.catalog_tree.bind("<Button-1>", self._on_catalog_tree_click)
         self.catalog_tree.bind("<Motion>", self._on_catalog_tree_motion)
+        self.catalog_tree.bind("<Leave>", lambda _e: self.catalog_tree.config(cursor=""))
+        _TreeHoverTip(self.catalog_tree, self._catalog_tip)
         scrollbar = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL, command=self.catalog_tree.yview)
         self.catalog_tree.configure(yscrollcommand=scrollbar.set)
         self.catalog_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -517,7 +509,7 @@ class PackingApp(FbsPackingMixin, tk.Tk):
         self.destroy()
 
     def open_settings(self) -> None:
-        SettingsWindow(self, self.config_data, self.apply_settings)
+        SettingsWindow(self, self.config_data, self.apply_settings, client=self.client)
 
     def apply_settings(self, config: dict[str, str]) -> None:
         save_config(config)
@@ -926,107 +918,66 @@ class PackingApp(FbsPackingMixin, tk.Tk):
         name = self.items.item(selected[0], "text")
         self._print_barcode_label(sku, name)
 
-    def _catalog_qty_display(self, product_id: str) -> str:
-        return self.catalog_row_qty.get(str(product_id), "")
-
-    def _resolve_catalog_copies(self, product_id: str) -> int:
-        raw = self.catalog_row_qty.get(str(product_id), "").strip()
-        if not raw:
-            raw = self.catalog_default_qty_var.get().strip()
+    def _resolve_catalog_copies(self) -> int:
+        raw = self.catalog_default_qty_var.get().strip()
         try:
             copies = int(raw or "1")
         except ValueError:
             copies = 1
         return max(1, min(9999, copies))
 
-    def _update_catalog_row_qty_display(self, item_id: str) -> None:
-        values = list(self.catalog_tree.item(item_id, "values"))
-        if len(values) >= 6:
-            values[5] = self._catalog_qty_display(item_id)
-            self.catalog_tree.item(item_id, values=values)
-
-    def _finish_catalog_qty_edit(self, item_id: str, value: str) -> None:
-        if self._catalog_qty_entry is not None:
-            self._catalog_qty_entry.destroy()
-            self._catalog_qty_entry = None
-        self._catalog_qty_edit_item = None
-        text = value.strip()
-        if text:
-            try:
-                copies = int(text)
-                if copies < 1 or copies > 9999:
-                    raise ValueError
-                self.catalog_row_qty[item_id] = str(copies)
-            except ValueError:
-                messagebox.showwarning("Ошибка", "Кол-во должно быть целым числом от 1 до 9999")
-        else:
-            self.catalog_row_qty.pop(item_id, None)
-        self._update_catalog_row_qty_display(item_id)
-
-    def _begin_catalog_qty_edit(self, item_id: str) -> None:
-        if self._catalog_qty_entry is not None and self._catalog_qty_edit_item:
-            self._finish_catalog_qty_edit(self._catalog_qty_edit_item, self._catalog_qty_entry.get())
-        bbox = self.catalog_tree.bbox(item_id, column="#6")
-        if not bbox:
-            return
-        x, y, width, height = bbox
-        var = tk.StringVar(value=self._catalog_qty_display(item_id))
-        entry = ttk.Entry(self.catalog_tree, textvariable=var, width=6, justify=tk.CENTER)
-        entry.place(x=x, y=y, width=width, height=height)
-        entry.focus_set()
-        entry.select_range(0, tk.END)
-        self._catalog_qty_entry = entry
-        self._catalog_qty_edit_item = item_id
-
-        def commit(_event=None, iid=item_id, widget=entry) -> None:
-            if self._catalog_qty_entry is not widget:
-                return
-            self._finish_catalog_qty_edit(iid, var.get())
-
-        entry.bind("<Return>", commit)
-        entry.bind("<FocusOut>", commit)
+    def _catalog_tip(self, row: str, col: str) -> str:
+        values = self.catalog_tree.item(row, "values") or ()
+        mapping = {"#1": 0, "#2": 1, "#3": 2}
+        idx = mapping.get(col)
+        if idx is None:
+            sku = str(values[0] if values else "")
+            name = str(values[1] if len(values) > 1 else "")
+            return " · ".join(part for part in (sku, name) if part)
+        if idx >= len(values):
+            return ""
+        return str(values[idx] or "")
 
     def _on_catalog_tree_motion(self, event) -> None:
         column = self.catalog_tree.identify_column(event.x)
-        if column == "#7":
+        if column == "#3":
             self.catalog_tree.config(cursor="hand2")
-        elif column == "#6":
-            self.catalog_tree.config(cursor="xterm")
         else:
             self.catalog_tree.config(cursor="")
 
     def _on_catalog_tree_click(self, event) -> None:
-        column = self.catalog_tree.identify_column(event.x)
+        if self.catalog_tree.identify_column(event.x) != "#3":
+            return
         item = self.catalog_tree.identify_row(event.y)
         if not item:
             return
-        if column == "#6":
-            self._begin_catalog_qty_edit(item)
-            return
-        if column == "#7":
-            self.print_catalog_barcode_for_product(int(item), event.x_root, event.y_root)
+        self.print_catalog_barcode_for_product(int(item), event.x_root, event.y_root)
 
     def _render_catalog_tree(self, products: list[dict]) -> None:
         self.catalog_tree.delete(*self.catalog_tree.get_children())
+        self._catalog_image_urls = {}
         for product in products:
+            iid = str(product.get("id") or "")
+            if not iid:
+                continue
             kind = "комплект" if product.get("is_kit") else ""
             name = str(product.get("name") or "")
             if kind:
                 name = f"{name} ({kind})"
-            self.catalog_tree.insert(
-                "",
-                tk.END,
-                iid=str(product.get("id")),
-                values=(
-                    product.get("code", ""),
-                    product.get("sku", ""),
-                    name,
-                    product.get("group_name", ""),
-                    product.get("unit_name", ""),
-                    self._catalog_qty_display(str(product.get("id"))),
-                    "▼ Печать ШК",
-                ),
-            )
+            sku = str(product.get("sku") or "")
+            url = str(product.get("image_url") or "").strip()
+            self._catalog_image_urls[iid] = url
+            if url:
+                self._fbs_ensure_image(url)
+            kwargs: dict = {
+                "iid": iid,
+                "text": "",
+                "values": (sku, name, "Печать ШК"),
+            }
+            photo = self._fbs_thumb_photo(url, _FBS_LIST_IMG) if url else None
+            if photo is not None:
+                kwargs["image"] = photo
+            self.catalog_tree.insert("", tk.END, **kwargs)
 
     def _show_barcode_pick_menu(
         self,
@@ -1164,7 +1115,7 @@ class PackingApp(FbsPackingMixin, tk.Tk):
         barcode = str(barcode_item.get("barcode") or "").strip()
         print_name = barcode_print_name(product, barcode_item)
         sku = str(product.get("sku") or barcode)
-        copies = self._resolve_catalog_copies(str(product.get("id") or ""))
+        copies = self._resolve_catalog_copies()
         label_w, label_h = self._label_size_mm()
 
         def worker():
@@ -1206,12 +1157,13 @@ class PackingApp(FbsPackingMixin, tk.Tk):
 
 
 class SettingsWindow(tk.Toplevel):
-    def __init__(self, parent, config: dict[str, str], on_save) -> None:
+    def __init__(self, parent, config: dict[str, str], on_save, client=None) -> None:
         super().__init__(parent)
         self.title("Настройки")
-        self.geometry("760x520")
+        self.geometry("760x640")
         self.resizable(True, False)
         self.on_save = on_save
+        self.client = client
         label_printer = config.get("printer_label") or config.get("printer", "")
         label_settings = config.get("print_settings_label") or config.get("print_settings", "")
         self.vars = {
@@ -1252,18 +1204,98 @@ class SettingsWindow(tk.Toplevel):
         )
         hint.grid(row=7, column=0, columnspan=3, sticky="we", pady=(12, 8))
 
+        cache_frame = ttk.LabelFrame(root, text="Кэш ярлыков FBS", padding=8)
+        cache_frame.grid(row=8, column=0, columnspan=3, sticky="we", pady=(0, 8))
+        self.cache_summary_label = ttk.Label(cache_frame, text=self._cache_summary_text())
+        self.cache_summary_label.pack(anchor="w")
+        ttk.Label(
+            cache_frame,
+            text="Удаляет скачанные PDF у заданий «Готово» и «Отменено». Задания в работе не трогает.",
+            wraplength=700,
+            foreground="#555",
+        ).pack(anchor="w", pady=(4, 6))
+        ttk.Button(
+            cache_frame,
+            text="Очистить кэш выполненных заданий",
+            command=self.clear_done_job_cache,
+        ).pack(anchor="w")
+
         buttons = ttk.Frame(root)
-        buttons.grid(row=8, column=0, columnspan=3, sticky="e")
+        buttons.grid(row=9, column=0, columnspan=3, sticky="e")
         ttk.Button(buttons, text="Отмена", command=self.destroy).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="Сохранить", command=self.save).pack(side=tk.RIGHT, padx=8)
 
         root.columnconfigure(1, weight=1)
-        self.geometry("760x520")
+        self.geometry("760x640")
 
     def _row(self, root, row: int, label: str, key: str, placeholder: str = "") -> None:
         ttk.Label(root, text=label).grid(row=row, column=0, sticky="w", pady=5, padx=(0, 8))
         ttk.Entry(root, textvariable=self.vars[key]).grid(row=row, column=1, sticky="we", pady=5)
         ttk.Label(root, text="").grid(row=row, column=2)
+
+    def _cache_summary_text(self) -> str:
+        summary = cache_summary()
+        return (
+            f"На диске: {summary['jobs']} заданий, {summary['files']} ярлыков, "
+            f"{format_cache_size(summary['bytes'])}."
+        )
+
+    def _refresh_cache_summary(self) -> None:
+        self.cache_summary_label.config(text=self._cache_summary_text())
+        hint_fn = getattr(self.master, "_fbs_update_cache_hint", None)
+        if callable(hint_fn):
+            try:
+                hint_fn()
+            except Exception:
+                pass
+
+    def clear_done_job_cache(self) -> None:
+        client = self.client
+        if client is None or not getattr(client, "api_ok", False):
+            messagebox.showinfo(
+                "Кэш ярлыков",
+                "Войдите в приложение и подключитесь к API, чтобы удалить кэш только у выполненных заданий.",
+                parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "Очистить кэш",
+            "Удалить скачанные ярлыки по выполненным и отменённым заданиям?\n"
+            "Задания в работе останутся.",
+            parent=self,
+        ):
+            return
+        try:
+            jobs = client.fbs_my_jobs()
+            keep: set[int] = set()
+            for job in jobs:
+                raw = job.get("id") if isinstance(job, dict) else None
+                if raw in (None, ""):
+                    continue
+                try:
+                    keep.add(int(raw))
+                except (TypeError, ValueError):
+                    continue
+            result = clear_except(keep)
+        except AuthError as exc:
+            messagebox.showerror("Сессия", str(exc), parent=self)
+            return
+        except Exception as exc:
+            messagebox.showerror("Ошибка", str(exc), parent=self)
+            return
+        self._refresh_cache_summary()
+        if result["jobs"] <= 0:
+            messagebox.showinfo(
+                "Кэш ярлыков",
+                "Нечего удалять: кэш выполненных заданий пуст.",
+                parent=self,
+            )
+            return
+        messagebox.showinfo(
+            "Кэш ярлыков",
+            f"Удалено заданий: {result['jobs']} ({format_cache_size(result['bytes'])}).",
+            parent=self,
+        )
 
     def save(self) -> None:
         config = {key: var.get().strip() for key, var in self.vars.items()}

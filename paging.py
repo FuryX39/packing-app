@@ -39,18 +39,77 @@ def page_range_label(total: int, page: int, page_size: int = PAGE_SIZE) -> str:
     return f"{start}–{end} из {total}"
 
 
-def catalog_matches(product: dict, query: str) -> bool:
+def _barcode_texts(raw) -> list[str]:
+    out: list[str] = []
+    for item in raw or []:
+        if isinstance(item, dict):
+            code = str(item.get("barcode") or "").strip()
+        else:
+            code = str(item or "").strip()
+        if code:
+            out.append(code)
+    return out
+
+
+def text_matches(query: str, *fields: object) -> bool:
     needle = str(query or "").strip().casefold()
     if not needle:
         return True
-    fields = (
+    return any(needle in str(field or "").casefold() for field in fields)
+
+
+def catalog_matches(product: dict, query: str) -> bool:
+    return text_matches(
+        query,
         product.get("name", ""),
         product.get("sku", ""),
         product.get("code", ""),
         product.get("external_code", ""),
         product.get("group_name", ""),
+        *_barcode_texts(product.get("barcodes")),
     )
-    return any(needle in str(field or "").casefold() for field in fields)
+
+
+def job_line_matches(line: dict, query: str, *extra: object) -> bool:
+    return text_matches(
+        query,
+        line.get("sku", ""),
+        line.get("product_name", ""),
+        line.get("name", ""),
+        line.get("order_id", ""),
+        line.get("order_display", ""),
+        line.get("barcode", ""),
+        *extra,
+    )
+
+
+def remaining_group_matches(group: dict, query: str) -> bool:
+    return text_matches(
+        query,
+        group.get("sku", ""),
+        group.get("name", ""),
+        group.get("barcode", ""),
+    )
+
+
+def format_fbs_picked_text(lines: list[dict], *, skip_mp: bool = False) -> str:
+    if not lines:
+        return ""
+    first = lines[0]
+    cis_note = " · КИЗ" if first.get("has_cis") else ""
+    sku = first.get("sku") or ""
+    name = first.get("product_name") or first.get("name") or ""
+    if len(lines) == 1:
+        return (
+            f"SKU {sku} · {name} · "
+            f"заказ {first.get('order_display') or first.get('order_id')} · "
+            f"строка #{first.get('id')}{cis_note}"
+        )
+    orders = ", ".join(
+        str(item.get("order_display") or item.get("order_id") or "?") for item in lines
+    )
+    confirm = "" if skip_mp else " · пропикайте ярлыки подряд"
+    return f"SKU {sku} · {name} · {len(lines)} шт. · заказы: {orders}{confirm}{cis_note}"
 
 
 def filter_catalog(products: Sequence[dict], query: str) -> list[dict]:

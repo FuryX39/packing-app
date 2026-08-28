@@ -3,11 +3,11 @@ from __future__ import annotations
 import threading
 from datetime import date, timedelta
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 import os
 import ctypes
 
-from api_client import AuthError, WarehouseApiClient
+from api_client import ApiError, AuthError, WarehouseApiClient
 from fbs_packing_ui import FbsPackingMixin, _FBS_LIST_IMG, _TreeHoverTip
 from paging import PageBar, catalog_matches
 from label_cache import cache_summary, clear_except, format_cache_size
@@ -422,7 +422,7 @@ class PackingApp(FbsPackingMixin, tk.Tk):
         tree_wrap.pack(fill=tk.BOTH, expand=True)
         self.catalog_tree = ttk.Treeview(
             tree_wrap,
-            columns=("sku", "name", "print"),
+            columns=("sku", "name", "print", "add_bc"),
             show="tree headings",
             style="CatalogPrint.Treeview",
         )
@@ -430,10 +430,12 @@ class PackingApp(FbsPackingMixin, tk.Tk):
         self.catalog_tree.heading("sku", text="Артикул")
         self.catalog_tree.heading("name", text="Название")
         self.catalog_tree.heading("print", text="Печать ШК")
+        self.catalog_tree.heading("add_bc", text="Внести ШК")
         self.catalog_tree.column("#0", width=52, stretch=False, minwidth=52)
         self.catalog_tree.column("sku", width=120, stretch=False, minwidth=80)
         self.catalog_tree.column("name", width=360, minwidth=160)
         self.catalog_tree.column("print", width=120, stretch=False, minwidth=100, anchor=tk.CENTER)
+        self.catalog_tree.column("add_bc", width=120, stretch=False, minwidth=100, anchor=tk.CENTER)
         self.catalog_tree.bind("<Button-1>", self._on_catalog_tree_click)
         self.catalog_tree.bind("<Motion>", self._on_catalog_tree_motion)
         self.catalog_tree.bind("<Leave>", lambda _e: self.catalog_tree.config(cursor=""))
@@ -932,7 +934,7 @@ class PackingApp(FbsPackingMixin, tk.Tk):
 
     def _catalog_tip(self, row: str, col: str) -> str:
         values = self.catalog_tree.item(row, "values") or ()
-        mapping = {"#1": 0, "#2": 1, "#3": 2}
+        mapping = {"#1": 0, "#2": 1, "#3": 2, "#4": 3}
         idx = mapping.get(col)
         if idx is None:
             sku = str(values[0] if values else "")
@@ -944,18 +946,20 @@ class PackingApp(FbsPackingMixin, tk.Tk):
 
     def _on_catalog_tree_motion(self, event) -> None:
         column = self.catalog_tree.identify_column(event.x)
-        if column == "#3":
+        if column in {"#3", "#4"}:
             self.catalog_tree.config(cursor="hand2")
         else:
             self.catalog_tree.config(cursor="")
 
     def _on_catalog_tree_click(self, event) -> None:
-        if self.catalog_tree.identify_column(event.x) != "#3":
-            return
+        column = self.catalog_tree.identify_column(event.x)
         item = self.catalog_tree.identify_row(event.y)
         if not item:
             return
-        self.print_catalog_barcode_for_product(int(item), event.x_root, event.y_root)
+        if column == "#3":
+            self.print_catalog_barcode_for_product(int(item), event.x_root, event.y_root)
+        elif column == "#4":
+            self.add_catalog_barcode_for_product(int(item))
 
     def _render_catalog_tree(self, products: list[dict]) -> None:
         self.catalog_tree.delete(*self.catalog_tree.get_children())
@@ -976,7 +980,7 @@ class PackingApp(FbsPackingMixin, tk.Tk):
             kwargs: dict = {
                 "iid": iid,
                 "text": "",
-                "values": (sku, name, "Печать ШК"),
+                "values": (sku, name, "Печать ШК", "Внести ШК"),
             }
             photo = self._fbs_thumb_photo(url, _FBS_LIST_IMG) if url else None
             if photo is not None:
@@ -1041,6 +1045,64 @@ class PackingApp(FbsPackingMixin, tk.Tk):
 
         self.set_status("Загрузка штрихкодов...")
         self._run_task(worker, on_barcodes, on_error)
+
+    def _catalog_product_by_id(self, product_id: int) -> dict | None:
+        for pool in (self.catalog_products, self.catalog_products_all):
+            found = next((p for p in pool if int(p.get("id") or 0) == product_id), None)
+            if found is not None:
+                return found
+        return None
+
+    def _store_catalog_barcodes(self, product_id: int, barcodes: list[dict[str, str]]) -> None:
+        self.catalog_barcode_cache[product_id] = barcodes
+        for pool in (self.catalog_products, self.catalog_products_all):
+            for product in pool:
+                if int(product.get("id") or 0) == product_id:
+                    product["barcodes"] = barcodes
+                    product["barcode_count"] = len(barcodes)
+
+    def add_catalog_barcode_for_product(self, product_id: int) -> None:
+        product = self._catalog_product_by_id(product_id)
+        if product is None:
+            messagebox.showwarning("Нет товара", "Товар не найден — обновите список")
+            return
+        sku = str(product.get("sku") or "").strip()
+        name = str(product.get("name") or "").strip()
+        code = simpledialog.askstring(
+            "Внести ШК",
+            f"{sku}  {name}\n\nПропикайте или введите штрихкод:",
+            parent=self,
+        )
+        if code is None:
+            return
+        barcode = str(code).strip()
+        if not barcode:
+            return
+
+        def worker():
+            return self.client.add_catalog_barcode(product_id, barcode)
+
+        def on_ok(payload: dict) -> None:
+            details = payload.get("product") or {}
+            barcodes = normalize_barcodes(details.get("barcodes"))
+            if barcode not in {item["barcode"] for item in barcodes}:
+                barcodes.append({"barcode": barcode, "label": "", "group": ""})
+            self._store_catalog_barcodes(product_id, barcodes)
+            result = str(payload.get("result") or "")
+            if result == "updated":
+                self.set_status(f"ШК {barcode} уже был у {sku}")
+            else:
+                self.set_status(f"ШК {barcode} добавлен к {sku}")
+
+        def on_error(exc: Exception) -> None:
+            if isinstance(exc, ApiError):
+                messagebox.showerror("Штрихкод", str(exc))
+                self.set_status(str(exc))
+                return
+            self._background_error(exc)
+
+        self.set_status("Сохранение штрихкода...")
+        self._run_task(worker, on_ok, on_error)
 
     def _catalog_status_text(self) -> str:
         total = len(self.catalog_products)

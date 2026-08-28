@@ -20,7 +20,7 @@ from label_cache import (
 )
 from local_print import print_pdf, render_code128_image
 from packing_config import load_config, save_config
-from paging import PageBar
+from paging import PageBar, format_fbs_picked_text, job_line_matches, remaining_group_matches
 
 _FBS_JOB_STATUS_RU = {
     "open": "Открыто",
@@ -320,6 +320,7 @@ class FbsPackingMixin:
         self._fbs_prefetching_job_id: int | None = None
         self._fbs_jobs_filling = False
         self._fbs_paged_job_id: object | None = None
+        self._fbs_lines_search_job: str | None = None
         cfg = load_config()
         skip_raw = str(cfg.get("fbs_skip_mp_confirm") or "").strip().lower()
         self.fbs_skip_mp_var = tk.BooleanVar(value=skip_raw in {"1", "true", "yes", "on"})
@@ -400,7 +401,7 @@ class FbsPackingMixin:
         active_text = ttk.Frame(active_inner)
         active_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.fbs_active_var = tk.StringVar(value="Нет активной строки — пикните товар")
-        ttk.Label(active_text, textvariable=self.fbs_active_var, wraplength=420).pack(anchor=tk.W)
+        ttk.Label(active_text, textvariable=self.fbs_active_var, wraplength=720).pack(anchor=tk.W)
         active_btns = ttk.Frame(active_text)
         active_btns.pack(fill=tk.X, pady=(8, 0))
         ttk.Button(active_btns, text="Перепечатать ярлык", command=self.fbs_reprint_active).pack(side=tk.LEFT)
@@ -491,6 +492,15 @@ class FbsPackingMixin:
 
         self.fbs_lines_frame = ttk.LabelFrame(right, text="Строки задания", padding=6)
         self.fbs_lines_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        search_row = ttk.Frame(self.fbs_lines_frame)
+        search_row.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        ttk.Label(search_row, text="Поиск в задании").pack(side=tk.LEFT)
+        self.fbs_lines_search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_row, textvariable=self.fbs_lines_search_var)
+        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        search_entry.bind("<KeyRelease>", self._on_fbs_lines_search_key)
+        search_entry.bind("<Return>", lambda _e: self._apply_fbs_lines_search())
+        ttk.Button(search_row, text="Найти", command=self._apply_fbs_lines_search).pack(side=tk.LEFT)
         self.fbs_lines_pager = PageBar(self.fbs_lines_frame, on_change=self._fbs_fill_lines_table)
         self.fbs_lines_pager.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
         self.fbs_lines_table = _FbsLinesTable(
@@ -617,18 +627,23 @@ class FbsPackingMixin:
             return
         self._fbs_set_active_image("")
 
-    def _fbs_last_picked_line(self) -> dict | None:
+    def _fbs_last_picked_lines(self) -> list[dict]:
         job = self.fbs_job or {}
         ids = {int(x) for x in self._fbs_last_scan_line_ids if str(x).strip()}
         if not ids:
-            return None
+            return []
+        found: list[dict] = []
         for line in job.get("lines") or []:
             try:
                 if int(line.get("id")) in ids:
-                    return line
+                    found.append(line)
             except (TypeError, ValueError):
                 continue
-        return None
+        return found
+
+    def _fbs_last_picked_line(self) -> dict | None:
+        picked = self._fbs_last_picked_lines()
+        return picked[0] if picked else None
 
     def _fbs_lines_context_menu(self, event, iid: str) -> None:
         job = self.fbs_job or {}
@@ -943,35 +958,15 @@ class FbsPackingMixin:
         active = job.get("active_line")
         active_lines = job.get("active_lines") or ([] if not active else [active])
         if active_lines:
-            first = active_lines[0]
-            cis_note = " · КИЗ" if first.get("has_cis") else ""
-            if len(active_lines) == 1:
-                self.fbs_active_var.set(
-                    f"SKU {first.get('sku')} · {first.get('product_name') or ''} · "
-                    f"заказ {first.get('order_display') or first.get('order_id')} · "
-                    f"строка #{first.get('id')}{cis_note}"
-                )
-            else:
-                orders = ", ".join(
-                    str(item.get("order_display") or item.get("order_id") or "?")
-                    for item in active_lines
-                )
-                self.fbs_active_var.set(
-                    f"SKU {first.get('sku')} · {first.get('product_name') or ''} · "
-                    f"в печати {len(active_lines)} шт. · заказы: {orders} · "
-                    f"пропикайте ярлыки подряд"
-                )
-            self._fbs_set_active_image(str(first.get("image_url") or ""))
+            self.fbs_active_var.set(
+                format_fbs_picked_text(active_lines, skip_mp=self._fbs_skip_mp_enabled())
+            )
+            self._fbs_set_active_image(str(active_lines[0].get("image_url") or ""))
         else:
-            last = self._fbs_last_picked_line()
-            if self._fbs_skip_mp_enabled() and last:
-                cis_note = " · КИЗ" if last.get("has_cis") else ""
-                self.fbs_active_var.set(
-                    f"SKU {last.get('sku')} · {last.get('product_name') or ''} · "
-                    f"заказ {last.get('order_display') or last.get('order_id')} · "
-                    f"строка #{last.get('id')}{cis_note}"
-                )
-                self._fbs_set_active_image(str(last.get("image_url") or ""))
+            picked = self._fbs_last_picked_lines()
+            if self._fbs_skip_mp_enabled() and picked:
+                self.fbs_active_var.set(format_fbs_picked_text(picked, skip_mp=True))
+                self._fbs_set_active_image(str(picked[0].get("image_url") or ""))
             else:
                 hint = "пикните КИЗ или товар" if job.get("require_cis") else "пикните товар"
                 if self._fbs_skip_mp_enabled():
@@ -982,7 +977,12 @@ class FbsPackingMixin:
         if getattr(self, "_fbs_paged_job_id", None) != jid:
             self.fbs_lines_pager.reset()
             self._fbs_paged_job_id = jid
-        if active_lines:
+            if hasattr(self, "fbs_lines_search_var"):
+                self.fbs_lines_search_var.set("")
+        query = ""
+        if hasattr(self, "fbs_lines_search_var"):
+            query = self.fbs_lines_search_var.get().strip()
+        if active_lines and not query:
             active_id = str(active_lines[0].get("id") or "")
             for index, line in enumerate(job.get("lines") or []):
                 if str(line.get("id") or "") == active_id:
@@ -992,9 +992,52 @@ class FbsPackingMixin:
         if self.fbs_manual_var.get():
             self._fbs_render_remaining()
 
-    def _fbs_fill_lines_table(self) -> None:
+    def _fbs_search_query(self) -> str:
+        if not hasattr(self, "fbs_lines_search_var"):
+            return ""
+        return self.fbs_lines_search_var.get().strip()
+
+    def _fbs_barcode_by_sku(self) -> dict[str, str]:
         job = self.fbs_job or {}
+        out: dict[str, str] = {}
+        for group in job.get("remaining_groups") or []:
+            sku = str(group.get("sku") or "").strip().casefold()
+            code = str(group.get("barcode") or "").strip()
+            if sku and code:
+                out[sku] = code
+        return out
+
+    def _fbs_filtered_lines(self) -> list[dict]:
+        job = self.fbs_job or {}
+        query = self._fbs_search_query()
+        barcodes = self._fbs_barcode_by_sku()
         lines = list(job.get("lines") or [])
+        if not query:
+            return lines
+        return [
+            line
+            for line in lines
+            if job_line_matches(
+                line,
+                query,
+                barcodes.get(str(line.get("sku") or "").strip().casefold(), ""),
+            )
+        ]
+
+    def _on_fbs_lines_search_key(self, _event=None) -> None:
+        if self._fbs_lines_search_job is not None:
+            self.after_cancel(self._fbs_lines_search_job)
+        self._fbs_lines_search_job = self.after(300, self._apply_fbs_lines_search)
+
+    def _apply_fbs_lines_search(self) -> None:
+        self._fbs_lines_search_job = None
+        self.fbs_lines_pager.reset()
+        self._fbs_fill_lines_table()
+        if self.fbs_manual_var.get():
+            self._fbs_render_remaining()
+
+    def _fbs_fill_lines_table(self) -> None:
+        lines = self._fbs_filtered_lines()
         visible = self.fbs_lines_pager.slice_items(lines)
         self.fbs_lines_table.clear()
         self._fbs_line_urls = {}
@@ -1019,11 +1062,16 @@ class FbsPackingMixin:
 
     def _fbs_render_remaining(self) -> None:
         job = self.fbs_job or {}
-        groups = job.get("remaining_groups") or []
+        groups = list(job.get("remaining_groups") or [])
+        query = self._fbs_search_query()
         self.fbs_remaining_tree.delete(*self.fbs_remaining_tree.get_children())
         self._fbs_remaining_urls = {}
+        visible_iids: list[str] = []
         for idx, group in enumerate(groups):
+            if query and not remaining_group_matches(group, query):
+                continue
             iid = str(idx)
+            visible_iids.append(iid)
             url = str(group.get("image_url") or "")
             self._fbs_remaining_urls[iid] = url
             photo = self._fbs_thumb_photo(url, _FBS_LIST_IMG) if url else None
@@ -1039,9 +1087,9 @@ class FbsPackingMixin:
             if photo is not None:
                 kwargs["image"] = photo
             self.fbs_remaining_tree.insert("", tk.END, **kwargs)
-        if groups:
-            self.fbs_remaining_tree.selection_set("0")
-            self.fbs_remaining_tree.focus("0")
+        if visible_iids:
+            self.fbs_remaining_tree.selection_set(visible_iids[0])
+            self.fbs_remaining_tree.focus(visible_iids[0])
             self.on_fbs_remaining_select()
         else:
             self._fbs_selected_group = None

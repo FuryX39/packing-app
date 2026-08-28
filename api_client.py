@@ -242,6 +242,15 @@ class WarehouseApiClient:
         )
         return resp.json().get("product") or {}
 
+    def add_catalog_barcode(self, product_id: int, barcode: str) -> dict:
+        resp = self._request(
+            "POST",
+            f"/api/warehouse/catalog/products/{int(product_id)}/barcodes",
+            json={"barcode": str(barcode or "").strip()},
+            timeout=20,
+        )
+        return resp.json()
+
     # --- FBS packing (desktop API) ---
 
     def fbs_my_jobs(self) -> list[dict]:

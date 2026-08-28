@@ -15,8 +15,11 @@ from paging import (
     catalog_matches,
     clamp_page,
     filter_catalog,
+    format_fbs_picked_text,
+    job_line_matches,
     page_count,
     page_range_label,
+    remaining_group_matches,
     slice_page,
 )
 
@@ -108,6 +111,37 @@ class CatalogFilterThenPageTest(unittest.TestCase):
         self.assertTrue(catalog_matches(product, "плед"))
         self.assertTrue(catalog_matches(product, "abc"))
         self.assertFalse(catalog_matches(product, "красный"))
+
+    def test_catalog_matches_added_barcode(self) -> None:
+        product = {
+            "sku": "ABC-1",
+            "name": "Плед",
+            "barcodes": [{"barcode": "2000000000016"}],
+        }
+        self.assertTrue(catalog_matches(product, "2000000000016"))
+
+
+class FbsSearchAndQtyTest(unittest.TestCase):
+    def test_skip_mp_batch_shows_order_count(self) -> None:
+        lines = [
+            {"id": 1, "sku": "A-1", "product_name": "Плед", "order_display": "100"},
+            {"id": 2, "sku": "A-1", "product_name": "Плед", "order_display": "101"},
+            {"id": 3, "sku": "A-1", "product_name": "Плед", "order_id": "102"},
+        ]
+        text = format_fbs_picked_text(lines, skip_mp=True)
+        self.assertIn("3 шт.", text)
+        self.assertIn("100", text)
+        self.assertIn("101", text)
+        self.assertIn("102", text)
+        self.assertNotIn("пропикайте", text)
+
+    def test_job_search_matches_sku_name_order(self) -> None:
+        line = {"sku": "ABC-9", "product_name": "Синий плед", "order_display": "Y-55"}
+        self.assertTrue(job_line_matches(line, "плед"))
+        self.assertTrue(job_line_matches(line, "abc-9"))
+        self.assertTrue(job_line_matches(line, "y-55"))
+        self.assertFalse(job_line_matches(line, "красный"))
+        self.assertTrue(remaining_group_matches({"sku": "ABC-9", "barcode": "2000001"}, "2000001"))
 
 
 class PageBarWidgetTest(unittest.TestCase):

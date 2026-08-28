@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import ctypes
 import io
 import os
 import re
+import shutil
 import sys
+import sysconfig
 import threading
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
@@ -33,41 +37,80 @@ _VERTRES = 10
 _LOGPIXELSX = 88
 _LOGPIXELSY = 90
 _PYWIN32_READY = False
+# os.add_dll_directory возвращает handle: если его выбросить, Python 3.8+
+# снова перестаёт искать DLL в этой папке (GC закрывает cookie).
+_DLL_DIR_HANDLES: list[object] = []
+
+
+class _DOCINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_int),
+        ("lpszDocName", wintypes.LPCWSTR),
+        ("lpszOutput", wintypes.LPCWSTR),
+        ("lpszDatatype", wintypes.LPCWSTR),
+        ("fwType", wintypes.DWORD),
+    ]
+
+
+def _pywin32_folders() -> list[Path]:
+    sites: list[Path] = []
+    platlib = sysconfig.get_path("platlib")
+    if platlib:
+        sites.append(Path(platlib))
+    for root in (Path(sys.prefix), Path(getattr(sys, "base_prefix", sys.prefix) or sys.prefix)):
+        sites.append(root / "Lib" / "site-packages")
+        sites.append(root / "lib" / "site-packages")
+    out: list[Path] = []
+    seen: set[str] = set()
+    for site in sites:
+        for rel in ("pywin32_system32", "win32", "win32/lib", "Pythonwin"):
+            folder = site / rel
+            key = str(folder).casefold()
+            if key in seen or not folder.is_dir():
+                continue
+            seen.add(key)
+            out.append(folder)
+    return out
+
+
+def _copy_pywin32_dlls() -> None:
+    """Кладём pywintypes/pythoncom рядом с pythonw.exe — так ищет загрузчик Windows."""
+    dests = [Path(sys.executable).resolve().parent, Path(sys.prefix)]
+    for folder in _pywin32_folders():
+        if folder.name.casefold() != "pywin32_system32":
+            continue
+        for dll in folder.glob("*.dll"):
+            for dest in dests:
+                target = dest / dll.name
+                try:
+                    if target.exists() and target.stat().st_size == dll.stat().st_size:
+                        continue
+                    shutil.copy2(dll, target)
+                except OSError:
+                    continue
 
 
 def _ensure_pywin32() -> None:
-    """pywin32 часто стоит в pip, но DLL не в PATH этого Python (venv без postinstall)."""
+    """pywin32 часто стоит в pip, но DLL не рядом с pythonw (venv без postinstall)."""
     global _PYWIN32_READY
     if _PYWIN32_READY:
         return
-    prefixes = [Path(sys.prefix)]
-    base = Path(getattr(sys, "base_prefix", sys.prefix) or sys.prefix)
-    if base not in prefixes:
-        prefixes.append(base)
-    folders: list[Path] = []
-    for root in prefixes:
-        site = root / "Lib" / "site-packages"
-        folders.extend(
-            (
-                site / "pywin32_system32",
-                site / "win32",
-                site / "win32" / "lib",
-            )
-        )
+    folders = _pywin32_folders()
     path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    add = getattr(os, "add_dll_directory", None)
     for folder in folders:
-        if not folder.is_dir():
-            continue
         folder_s = str(folder)
         if folder_s not in path_parts:
             os.environ["PATH"] = folder_s + os.pathsep + os.environ.get("PATH", "")
             path_parts.insert(0, folder_s)
-        add = getattr(os, "add_dll_directory", None)
         if add is not None:
             try:
-                add(folder_s)
+                handle = add(folder_s)
             except OSError:
-                pass
+                handle = None
+            if handle is not None:
+                _DLL_DIR_HANDLES.append(handle)
+    _copy_pywin32_dlls()
     try:
         import pywin32_bootstrap  # noqa: F401
     except ImportError:
@@ -75,14 +118,37 @@ def _ensure_pywin32() -> None:
     _PYWIN32_READY = True
 
 
+def bootstrap_print_modules() -> None:
+    """Проверка для start.bat: печать идёт через win32print/win32gui, без win32ui/MFC."""
+    _ensure_pywin32()
+    import win32gui  # noqa: F401
+    import win32print  # noqa: F401
+
+
 def _pywin32_error(exc: BaseException) -> RuntimeError:
     return RuntimeError(
-        "Не удалось загрузить pywin32 для печати.\n"
+        "Не удалось загрузить модули печати Windows (pywin32).\n"
         f"Этот Python: {sys.executable}\n"
         f"Ошибка: {exc}\n"
-        "Запускайте start.bat (чтобы шёл .venv). "
-        "В том же Python: python -m pip install --force-reinstall pywin32"
+        "Запускайте start.bat setup (переустановка .venv).\n"
+        "Печать не требует win32ui. Если ошибка всё ещё про DLL — "
+        "поставьте Microsoft Visual C++ Redistributable x64."
     )
+
+
+def _gdi32():
+    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+    gdi32.GetDeviceCaps.argtypes = [wintypes.HDC, ctypes.c_int]
+    gdi32.GetDeviceCaps.restype = ctypes.c_int
+    gdi32.StartDocW.argtypes = [wintypes.HDC, ctypes.POINTER(_DOCINFOW)]
+    gdi32.StartDocW.restype = ctypes.c_int
+    gdi32.StartPage.argtypes = [wintypes.HDC]
+    gdi32.StartPage.restype = ctypes.c_int
+    gdi32.EndPage.argtypes = [wintypes.HDC]
+    gdi32.EndPage.restype = ctypes.c_int
+    gdi32.EndDoc.argtypes = [wintypes.HDC]
+    gdi32.EndDoc.restype = ctypes.c_int
+    return gdi32
 
 
 def _parse_print_settings(print_settings: str) -> dict[str, Any]:
@@ -203,6 +269,13 @@ def _dest_rect(
     return (x, y, x + draw_w, y + draw_h)
 
 
+def _hdc_int(hdc: object) -> int:
+    if hasattr(hdc, "GetHandleOutput"):
+        return int(hdc.GetHandleOutput())
+    handle = getattr(hdc, "handle", hdc)
+    return int(handle)
+
+
 def _gdi_print_pages(
     pages: list[tuple[Image.Image, tuple[float, float]]],
     *,
@@ -210,10 +283,10 @@ def _gdi_print_pages(
     copies: int,
     options: dict[str, Any],
 ) -> None:
+    # win32ui тянет MFC (mfc140u.dll). На складах его часто нет — печать через gdi32.
     _ensure_pywin32()
     import win32gui
     import win32print
-    import win32ui
     from PIL import ImageWin
 
     printer_name = _resolve_printer(printer)
@@ -222,28 +295,48 @@ def _gdi_print_pages(
         devmode = win32print.GetPrinter(handle, 2).get("pDevMode")
         if devmode is not None:
             _apply_devmode(devmode, options)
-            hdc_handle = win32gui.CreateDC("WINSPOOL", printer_name, devmode)
+            hdc = win32gui.CreateDC("WINSPOOL", printer_name, devmode)
         else:
-            hdc_handle = win32gui.CreateDC("WINSPOOL", printer_name, None)
+            hdc = win32gui.CreateDC("WINSPOOL", printer_name, None)
     finally:
         win32print.ClosePrinter(handle)
 
-    dc = win32ui.CreateDCFromHandle(hdc_handle)
+    hdc_int = _hdc_int(hdc)
+    gdi32 = _gdi32()
     try:
-        area = (int(dc.GetDeviceCaps(_HORZRES)), int(dc.GetDeviceCaps(_VERTRES)))
-        dpi = (int(dc.GetDeviceCaps(_LOGPIXELSX) or 203), int(dc.GetDeviceCaps(_LOGPIXELSY) or 203))
-        dc.StartDoc("Warehouse packing")
+        area = (
+            int(gdi32.GetDeviceCaps(hdc_int, _HORZRES)),
+            int(gdi32.GetDeviceCaps(hdc_int, _VERTRES)),
+        )
+        dpi = (
+            int(gdi32.GetDeviceCaps(hdc_int, _LOGPIXELSX) or 203),
+            int(gdi32.GetDeviceCaps(hdc_int, _LOGPIXELSY) or 203),
+        )
+        docinfo = _DOCINFOW()
+        docinfo.cbSize = ctypes.sizeof(_DOCINFOW)
+        docinfo.lpszDocName = "Warehouse packing"
+        docinfo.lpszOutput = None
+        docinfo.lpszDatatype = None
+        docinfo.fwType = 0
+        if gdi32.StartDocW(hdc_int, ctypes.byref(docinfo)) <= 0:
+            err = ctypes.get_last_error()
+            raise OSError(err, f"StartDoc failed (Win32 {err})")
         try:
             for _copy in range(copies):
                 for image, page_pts in pages:
-                    dc.StartPage()
+                    if gdi32.StartPage(hdc_int) <= 0:
+                        err = ctypes.get_last_error()
+                        raise OSError(err, f"StartPage failed (Win32 {err})")
                     dib = ImageWin.Dib(image)
-                    dib.draw(dc.GetHandleOutput(), _dest_rect(image, page_pts, area, dpi, noscale=options["noscale"]))
-                    dc.EndPage()
+                    dib.draw(
+                        hdc_int,
+                        _dest_rect(image, page_pts, area, dpi, noscale=options["noscale"]),
+                    )
+                    gdi32.EndPage(hdc_int)
         finally:
-            dc.EndDoc()
+            gdi32.EndDoc(hdc_int)
     finally:
-        dc.DeleteDC()
+        win32gui.DeleteDC(hdc)
 
 
 def print_pdf(

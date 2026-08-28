@@ -242,11 +242,22 @@ class WarehouseApiClient:
         )
         return resp.json().get("product") or {}
 
-    def add_catalog_barcode(self, product_id: int, barcode: str) -> dict:
+    def add_catalog_barcode(
+        self,
+        product_id: int,
+        barcode: str,
+        *,
+        label: str = "",
+        group: str = "",
+    ) -> dict:
         resp = self._request(
             "POST",
             f"/api/warehouse/catalog/products/{int(product_id)}/barcodes",
-            json={"barcode": str(barcode or "").strip()},
+            json={
+                "barcode": str(barcode or "").strip(),
+                "label": str(label or "").strip(),
+                "group": str(group or "").strip(),
+            },
             timeout=20,
         )
         return resp.json()

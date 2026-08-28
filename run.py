@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 from datetime import date, timedelta
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import messagebox, ttk
 import os
 import ctypes
 
@@ -218,6 +218,64 @@ class LoginWindow(tk.Tk):
         self.destroy()
 
 
+class AddBarcodeDialog(tk.Toplevel):
+    """Три поля как в вебе: название, группа, штрихкод."""
+
+    def __init__(self, master, *, sku: str, name: str) -> None:
+        super().__init__(master)
+        self.result: dict[str, str] | None = None
+        self.title("Добавить ШК")
+        self.transient(master)
+        self.resizable(False, False)
+        self.label_var = tk.StringVar()
+        self.group_var = tk.StringVar()
+        self.barcode_var = tk.StringVar()
+
+        root = ttk.Frame(self, padding=12)
+        root.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(root, text=f"{sku}  {name}", wraplength=420).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 10)
+        )
+        ttk.Label(root, text="Название").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(root, textvariable=self.label_var, width=42).grid(row=1, column=1, sticky="we", pady=4, padx=(8, 0))
+        ttk.Label(root, text="Группа").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(root, textvariable=self.group_var, width=42).grid(row=2, column=1, sticky="we", pady=4, padx=(8, 0))
+        ttk.Label(root, text="ШК").grid(row=3, column=0, sticky="w", pady=4)
+        barcode_entry = ttk.Entry(root, textvariable=self.barcode_var, width=42)
+        barcode_entry.grid(row=3, column=1, sticky="we", pady=4, padx=(8, 0))
+        ttk.Label(
+            root,
+            text="Название — как «ШК ВБ», группа — как «Озон». ШК можно пропикать.",
+            foreground="#555",
+            wraplength=420,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 10))
+        buttons = ttk.Frame(root)
+        buttons.grid(row=5, column=0, columnspan=2, sticky="e")
+        ttk.Button(buttons, text="Отмена", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Сохранить", command=self._save).pack(side=tk.RIGHT, padx=8)
+        root.columnconfigure(1, weight=1)
+        self.bind("<Return>", lambda _e: self._save())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        barcode_entry.focus_set()
+
+    def _save(self) -> None:
+        barcode = self.barcode_var.get().strip()
+        if not barcode:
+            messagebox.showwarning("Штрихкод", "Введите штрихкод", parent=self)
+            return
+        self.result = {
+            "label": self.label_var.get().strip(),
+            "group": self.group_var.get().strip(),
+            "barcode": barcode,
+        }
+        self.destroy()
+
+    def ask(self) -> dict[str, str] | None:
+        self.grab_set()
+        self.wait_window()
+        return self.result
+
+
 class PackingApp(FbsPackingMixin, tk.Tk):
     def __init__(self, config_data: dict[str, str], client: WarehouseApiClient, user_name: str) -> None:
         super().__init__()
@@ -422,7 +480,7 @@ class PackingApp(FbsPackingMixin, tk.Tk):
         tree_wrap.pack(fill=tk.BOTH, expand=True)
         self.catalog_tree = ttk.Treeview(
             tree_wrap,
-            columns=("sku", "name", "print", "add_bc"),
+            columns=("sku", "name", "print"),
             show="tree headings",
             style="CatalogPrint.Treeview",
         )
@@ -430,13 +488,12 @@ class PackingApp(FbsPackingMixin, tk.Tk):
         self.catalog_tree.heading("sku", text="Артикул")
         self.catalog_tree.heading("name", text="Название")
         self.catalog_tree.heading("print", text="Печать ШК")
-        self.catalog_tree.heading("add_bc", text="Внести ШК")
         self.catalog_tree.column("#0", width=52, stretch=False, minwidth=52)
         self.catalog_tree.column("sku", width=120, stretch=False, minwidth=80)
         self.catalog_tree.column("name", width=360, minwidth=160)
         self.catalog_tree.column("print", width=120, stretch=False, minwidth=100, anchor=tk.CENTER)
-        self.catalog_tree.column("add_bc", width=120, stretch=False, minwidth=100, anchor=tk.CENTER)
         self.catalog_tree.bind("<Button-1>", self._on_catalog_tree_click)
+        self.catalog_tree.bind("<Button-3>", self._on_catalog_tree_context)
         self.catalog_tree.bind("<Motion>", self._on_catalog_tree_motion)
         self.catalog_tree.bind("<Leave>", lambda _e: self.catalog_tree.config(cursor=""))
         _TreeHoverTip(self.catalog_tree, self._catalog_tip)
@@ -934,7 +991,7 @@ class PackingApp(FbsPackingMixin, tk.Tk):
 
     def _catalog_tip(self, row: str, col: str) -> str:
         values = self.catalog_tree.item(row, "values") or ()
-        mapping = {"#1": 0, "#2": 1, "#3": 2, "#4": 3}
+        mapping = {"#1": 0, "#2": 1, "#3": 2}
         idx = mapping.get(col)
         if idx is None:
             sku = str(values[0] if values else "")
@@ -946,20 +1003,35 @@ class PackingApp(FbsPackingMixin, tk.Tk):
 
     def _on_catalog_tree_motion(self, event) -> None:
         column = self.catalog_tree.identify_column(event.x)
-        if column in {"#3", "#4"}:
+        if column == "#3":
             self.catalog_tree.config(cursor="hand2")
         else:
             self.catalog_tree.config(cursor="")
 
     def _on_catalog_tree_click(self, event) -> None:
-        column = self.catalog_tree.identify_column(event.x)
+        if self.catalog_tree.identify_column(event.x) != "#3":
+            return
         item = self.catalog_tree.identify_row(event.y)
         if not item:
             return
-        if column == "#3":
-            self.print_catalog_barcode_for_product(int(item), event.x_root, event.y_root)
-        elif column == "#4":
-            self.add_catalog_barcode_for_product(int(item))
+        self.print_catalog_barcode_for_product(int(item), event.x_root, event.y_root)
+
+    def _on_catalog_tree_context(self, event) -> None:
+        item = self.catalog_tree.identify_row(event.y)
+        if not item:
+            return
+        self.catalog_tree.selection_set(item)
+        self.catalog_tree.focus(item)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(
+            label="Добавить ШК",
+            command=lambda: self.add_catalog_barcode_for_product(int(item)),
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
 
     def _render_catalog_tree(self, products: list[dict]) -> None:
         self.catalog_tree.delete(*self.catalog_tree.get_children())
@@ -980,7 +1052,7 @@ class PackingApp(FbsPackingMixin, tk.Tk):
             kwargs: dict = {
                 "iid": iid,
                 "text": "",
-                "values": (sku, name, "Печать ШК", "Внести ШК"),
+                "values": (sku, name, "Печать ШК"),
             }
             photo = self._fbs_thumb_photo(url, _FBS_LIST_IMG) if url else None
             if photo is not None:
@@ -1068,25 +1140,26 @@ class PackingApp(FbsPackingMixin, tk.Tk):
             return
         sku = str(product.get("sku") or "").strip()
         name = str(product.get("name") or "").strip()
-        code = simpledialog.askstring(
-            "Внести ШК",
-            f"{sku}  {name}\n\nПропикайте или введите штрихкод:",
-            parent=self,
-        )
-        if code is None:
+        fields = AddBarcodeDialog(self, sku=sku, name=name).ask()
+        if fields is None:
             return
-        barcode = str(code).strip()
-        if not barcode:
-            return
+        barcode = fields["barcode"]
 
         def worker():
-            return self.client.add_catalog_barcode(product_id, barcode)
+            return self.client.add_catalog_barcode(
+                product_id,
+                barcode,
+                label=fields["label"],
+                group=fields["group"],
+            )
 
         def on_ok(payload: dict) -> None:
             details = payload.get("product") or {}
             barcodes = normalize_barcodes(details.get("barcodes"))
             if barcode not in {item["barcode"] for item in barcodes}:
-                barcodes.append({"barcode": barcode, "label": "", "group": ""})
+                barcodes.append(
+                    {"barcode": barcode, "label": fields["label"], "group": fields["group"]}
+                )
             self._store_catalog_barcodes(product_id, barcodes)
             result = str(payload.get("result") or "")
             if result == "updated":
